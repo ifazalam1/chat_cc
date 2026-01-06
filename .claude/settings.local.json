@@ -5,7 +5,9 @@
       "Bash(php -m:*)",
       "Bash(findstr:*)",
       "Bash(php -i:*)",
-      "Bash(composer require:*)"
+      "Bash(composer require:*)",
+      "Bash(php artisan:*)",
+      "Bash(php artisan cache:clear:*)"
     ]
   }
 }

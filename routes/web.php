@@ -45,13 +45,7 @@ Route::post('/logout', function (Illuminate\Http\Request $request) {
 // Protected routes (require authentication)
 Route::middleware(['auth'])->group(function () {
 
-    // Main compare interface (aliased for compatibility)
-    Route::get('/{hexCode?}', [CompareController::class, 'index'])->name('chat.compare');
-
-    // Chat endpoint
-    Route::post('/chat-compare', [CompareController::class, 'multiModelChat'])->name('chat.multi-compare');
-
-    // Conversation management
+    // Conversation management (must be before catch-all route)
     Route::get('/get-multi-compare-chats', [CompareController::class, 'getMultiCompareChats'])->name('get-multi-compare-chats');
     Route::get('/get-multi-compare-conversation/{hexCode}', [CompareController::class, 'getMultiCompareConversation'])->name('get-multi-compare-conversation');
     Route::delete('/delete-multi-compare-conversation/{hexCode}', [CompareController::class, 'deleteMultiCompareConversation'])->name('delete-multi-compare-conversation');
@@ -91,6 +85,12 @@ Route::middleware(['auth'])->group(function () {
     Route::get('/ai/image/gallery', function () {
         return redirect(env('MAIN_SITE_URL', 'http://localhost:8000') . '/ai/image/gallery');
     })->name('ai.image.gallery');
+
+    // Chat endpoint
+    Route::post('/chat-compare', [CompareController::class, 'multiModelChat'])->name('chat.multi-compare');
+
+    // Main compare interface (catch-all route - must be last)
+    Route::get('/{hexCode?}', [CompareController::class, 'index'])->name('chat.compare');
 });
 
 // Public routes

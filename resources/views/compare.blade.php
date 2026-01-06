@@ -7739,6 +7739,16 @@
                 }
 
                 const response = await fetch(`{{ route("get-multi-compare-chats") }}?show_archived=${showArchived}`);
+
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+
+                const contentType = response.headers.get('content-type');
+                if (!contentType || !contentType.includes('application/json')) {
+                    throw new Error('Response is not JSON');
+                }
+
                 allConversations = await response.json();
 
                 if (resetPagination) {
@@ -7758,6 +7768,13 @@
                 renderConversations();
             } catch (error) {
                 console.error('Error loading conversations:', error);
+                conversationsList.innerHTML = `
+                    <div class="text-center text-gray-500 py-8">
+                        <i class="las la-comments text-4xl mb-2"></i>
+                        <p>No conversations yet</p>
+                    </div>
+                `;
+                allConversations = [];
             }
         }
 
