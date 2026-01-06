@@ -5959,6 +5959,11 @@
                     debugLog('All models completed');
                     if (data.hex_code) {
                         currentHexCode = data.hex_code;
+                        // ✅ Save hex_code to localStorage so conversation persists on refresh
+                        localStorage.setItem('multi_compare_current_hex_code', data.hex_code);
+                        // ✅ Update URL without page reload
+                        const newUrl = `{{ url('/') }}/${data.hex_code}`;
+                        window.history.pushState({ hexCode: data.hex_code }, '', newUrl);
                         loadConversations();
                     }
                     

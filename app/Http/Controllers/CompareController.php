@@ -4803,6 +4803,7 @@ class CompareController extends Controller
                 'type' => 'init',
                 'models' => $selectedModels,
                 'conversation_id' => $conversation->id,
+                'hex_code' => $conversation->hex_code,  // ✅ ADD THIS
                 'message' => $modeMessage,
                 'mode' => $uploadedImagePath ? 'editing' : (!empty($conversationHistory) ? 'refining' : 'generating'),
                 'optimization_mode' => $optimizationMode, // ✅ SEND MODE
@@ -5033,7 +5034,8 @@ class CompareController extends Controller
 
             echo "data: " . json_encode([
                 'type' => 'all_complete',
-                'conversation_id' => $conversation->id
+                'conversation_id' => $conversation->id,
+                'hex_code' => $conversation->hex_code  // ✅ ADD THIS
             ]) . "\n\n";
             
             echo "data: [DONE]\n\n";
