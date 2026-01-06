@@ -1,0 +1,1627 @@
+private function detectFileExportRequest($message)
+{
+    $message = strtolower(trim($message));
+    
+    Log::info('Checking for export request', ['message' => $message]);
+    
+    $fileFormats = [
+        'csv' => 'csv',
+        'excel' => 'xlsx',
+        'xlsx' => 'xlsx',
+        'spreadsheet' => 'xlsx',
+        'pdf' => 'pdf',
+        'word' => 'docx',
+        'docx' => 'docx',
+        'document' => 'docx',
+        'text' => 'txt',
+        'txt' => 'txt',
+        'notepad' => 'txt',
+        'powerpoint' => 'pptx',
+        'ppt' => 'pptx',
+        'presentation' => 'pptx',
+        'slide' => 'pptx',
+    ];
+    
+    // ✅ FIRST: Check if ANY format is mentioned
+    $formatFound = null;
+    foreach ($fileFormats as $keyword => $format) {
+        if (str_contains($message, $keyword)) {
+            $formatFound = $format;
+            Log::info('Format detected', ['keyword' => $keyword, 'format' => $format]);
+            break;
+        }
+    }
+    
+    // ✅ If no format mentioned, NOT an export request
+    if (!$formatFound) {
+        Log::info('No file format detected in message');
+        return null;
+    }
+    
+    // ✅ IMPROVED: Check for export intent words
+    $exportWords = [
+        'export',
+        'download',
+        'save',
+        'convert',
+        'generate',
+    ];
+    
+    $hasExportWord = false;
+    foreach ($exportWords as $word) {
+        if (str_contains($message, $word)) {
+            $hasExportWord = true;
+            Log::info('Export word detected', ['word' => $word]);
+            break;
+        }
+    }
+    
+    if (!$hasExportWord) {
+        Log::info('No export intent word found');
+        return null;
+    }
+    
+    // ✅ NEW: Check for CREATION phrases (these override export intent)
+    // These are requests to CREATE new content, not export existing
+    $creationPhrases = [
+        'write a',
+        'write an',
+        'create a',
+        'create an',
+        'make a',
+        'make an',
+        'build a',
+        'build an',
+        'design a',
+        'design an',
+        'show me a',
+        'show me an',
+        'give me a',
+        'give me an',
+        'provide a',
+        'provide an',
+    ];
+    
+    foreach ($creationPhrases as $phrase) {
+        if (str_contains($message, $phrase)) {
+            Log::info('Content creation phrase detected, not an export', [
+                'phrase' => $phrase
+            ]);
+            return null;
+        }
+    }
+    
+    // ✅ NEW: Specific patterns that indicate CREATION, not EXPORT
+    // Example: "generate a pdf with a chart" = CREATE
+    // Example: "export as pdf" = EXPORT
+    $creationPatterns = [
+        '/generate\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
+        '/create\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
+        '/make\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
+        '/write\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
+    ];
+    
+    foreach ($creationPatterns as $pattern) {
+        if (preg_match($pattern, $message)) {
+            Log::info('Creation pattern matched, not an export', [
+                'pattern' => $pattern
+            ]);
+            return null;
+        }
+    }
+    
+    // ✅ NEW: Strong export indicators
+    $strongExportIndicators = [
+        'export as',
+        'export to',
+        'export the',
+        'export this',
+        'export that',
+        'download as',
+        'download the',
+        'download this',
+        'download that',
+        'save as',
+        'save the',
+        'save this',
+        'save that',
+        'convert to',
+        'convert the',
+        'convert this',
+        'convert that',
+    ];
+    
+    $hasStrongIndicator = false;
+    foreach ($strongExportIndicators as $indicator) {
+        if (str_contains($message, $indicator)) {
+            $hasStrongIndicator = true;
+            Log::info('Strong export indicator found', ['indicator' => $indicator]);
+            break;
+        }
+    }
+    
+    // ✅ If we have a strong indicator, it's definitely an export
+    if ($hasStrongIndicator) {
+        Log::info('Export request CONFIRMED via strong indicator', ['format' => $formatFound]);
+        return $formatFound;
+    }
+    
+    // ✅ NEW: Check for content references (the code, the poem, the table, etc.)
+    $contentReferences = [
+        'the code',
+        'the poem',
+        'the song',
+        'the table',
+        'the list',
+        'the data',
+        'the content',
+        'the response',
+        'the message',
+        'the output',
+        'this code',
+        'this poem',
+        'this song',
+        'this table',
+        'that code',
+        'that poem',
+        'that song',
+        'above',
+        'previous',
+    ];
+    
+    $hasContentReference = false;
+    foreach ($contentReferences as $reference) {
+        if (str_contains($message, $reference)) {
+            $hasContentReference = true;
+            Log::info('Content reference found', ['reference' => $reference]);
+            break;
+        }
+    }
+    
+    // ✅ If we have an export word + content reference + format, it's an export
+    if ($hasExportWord && $hasContentReference && $formatFound) {
+        Log::info('Export request CONFIRMED via content reference', [
+            'export_word' => true,
+            'content_reference' => true,
+            'format' => $formatFound
+        ]);
+        return $formatFound;
+    }
+    
+    // ✅ Fallback: If we have export word + format but no clear creation intent, assume export
+    if ($hasExportWord && $formatFound) {
+        Log::info('Export request CONFIRMED via fallback logic', ['format' => $formatFound]);
+        return $formatFound;
+    }
+    
+    Log::info('No export intent detected, returning null');
+    return null;
+}
+
+/**
+ * Handle file export request - Generate separate files for each model
+ */
+private function handleFileExportRequest($format, $conversationId, $selectedModels, $exportMessage = '')
+{
+     try {
+        Log::info('File export requested', [
+            'format' => $format, 
+            'conversation_id' => $conversationId,
+            'selectedModels' => $selectedModels,
+            'export_message' => $exportMessage
+        ]);
+        
+        // Get conversation and messages
+        $conversation = MultiCompareConversation::with('messages')->findOrFail($conversationId);
+        
+        // ✅ NEW: Detect what content to export
+        $contentReference = $this->detectExportContentReference($exportMessage);
+        
+        Log::info('Export content reference', $contentReference);
+        
+        // ✅ NEW: Find the right message to export
+        $targetMessage = $this->findMessageToExport($conversation, $contentReference);
+        
+        if (!$targetMessage) {
+            return [
+                'success' => false,
+                'error' => 'No content found to export'
+            ];
+        }
+        
+        Log::info('Target message selected for export', [
+            'message_id' => $targetMessage->id,
+            'created_at' => $targetMessage->created_at
+        ]);
+        
+        // Extract data from the selected message
+        if (!$targetMessage->all_responses) {
+            return [
+                'success' => false,
+                'error' => 'No content found in the selected message'
+            ];
+        }
+        
+        $allResponses = $targetMessage->all_responses;
+        
+        // ✅ Log what's available for debugging
+        Log::info('Available responses in message', [
+            'response_keys' => array_keys($allResponses),
+            'count' => count($allResponses)
+        ]);
+        
+        $exportResults = []; // ✅ Store results for each model
+        
+        // ✅ SPECIAL HANDLING FOR SMART_ALL MODE
+        if (in_array('smart_all_auto', $selectedModels)) {
+            Log::info('Smart All mode detected, exporting first available response');
+            
+            // Remove 'files' key if it exists
+            unset($allResponses['files']);
+            
+            // Get the first actual model response (not 'export' or 'files')
+            $actualResponses = array_filter($allResponses, function($key) {
+                return $key !== 'export' && $key !== 'files';
+            }, ARRAY_FILTER_USE_KEY);
+            
+            if (empty($actualResponses)) {
+                return [
+                    'success' => false,
+                    'error' => 'No model responses found to export'
+                ];
+            }
+            
+            // Get the first response
+            $firstModelId = array_key_first($actualResponses);
+            $modelContent = $actualResponses[$firstModelId];
+            
+            Log::info('Exporting content from model', [
+                'model' => $firstModelId,
+                'content_length' => strlen($modelContent)
+            ]);
+            
+            // Process this single response
+            $result = $this->processSingleExport($format, $modelContent, $conversation->title, 'smart_all_auto', $firstModelId);
+            
+            if ($result['success']) {
+                $exportResults['smart_all_auto'] = $result;
+            }
+            
+        } else {
+            // ✅ IMPROVED: Generate separate file for EACH model with better matching
+            foreach ($selectedModels as $requestedModelId) {
+                $modelContent = null;
+                $actualModelUsed = null;
+                
+                Log::info('Looking for content for model', ['requested' => $requestedModelId]);
+                
+                // Strategy 1: Direct match
+                if (isset($allResponses[$requestedModelId])) {
+                    $modelContent = $allResponses[$requestedModelId];
+                    $actualModelUsed = $requestedModelId;
+                    Log::info('✅ Strategy 1: Direct match found');
+                }
+                
+                // Strategy 2: Find by provider (for both Fixed and Smart Same modes)
+                if (!$modelContent) {
+                    // Get provider from the requested model
+                    $requestedModelSettings = \App\Models\AISettings::where('openaimodel', $requestedModelId)->first();
+                    
+                    if ($requestedModelSettings) {
+                        $requestedProvider = $requestedModelSettings->provider;
+                        Log::info('Strategy 2: Searching by provider', ['provider' => $requestedProvider]);
+                        
+                        // Look through all responses for a model from the same provider
+                        foreach ($allResponses as $responseModelId => $response) {
+                            if ($responseModelId === 'files' || $responseModelId === 'export') {
+                                continue;
+                            }
+                            
+                            $responseModelSettings = \App\Models\AISettings::where('openaimodel', $responseModelId)->first();
+                            
+                            if ($responseModelSettings && $responseModelSettings->provider === $requestedProvider) {
+                                $modelContent = $response;
+                                $actualModelUsed = $responseModelId;
+                                Log::info('✅ Strategy 2: Found by provider match', [
+                                    'requested' => $requestedModelId,
+                                    'actual' => $responseModelId
+                                ]);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Strategy 3: For Smart Same mode with _smart_panel suffix
+                if (!$modelContent && str_contains($requestedModelId, '_smart_panel')) {
+                    $provider = str_replace('_smart_panel', '', $requestedModelId);
+                    Log::info('Strategy 3: Smart panel mode', ['provider' => $provider]);
+                    
+                    foreach ($allResponses as $responseModelId => $response) {
+                        if ($responseModelId === 'files' || $responseModelId === 'export') {
+                            continue;
+                        }
+                        
+                        $responseModelSettings = \App\Models\AISettings::where('openaimodel', $responseModelId)->first();
+                        
+                        if ($responseModelSettings && $responseModelSettings->provider === $provider) {
+                            $modelContent = $response;
+                            $actualModelUsed = $responseModelId;
+                            Log::info('✅ Strategy 3: Found via smart panel', [
+                                'panel' => $requestedModelId,
+                                'actual' => $responseModelId
+                            ]);
+                            break;
+                        }
+                    }
+                }
+                
+                if (!$modelContent) {
+                    Log::warning("❌ No content found for model after all strategies", [
+                        'requested_model' => $requestedModelId,
+                        'available_models' => array_keys($allResponses)
+                    ]);
+                    continue;
+                }
+                
+                Log::info('Processing export for model', [
+                    'requested_model' => $requestedModelId,
+                    'actual_model' => $actualModelUsed,
+                    'content_length' => strlen($modelContent)
+                ]);
+                
+                // Process this model's export (use requested model ID for panel mapping)
+                $result = $this->processSingleExport($format, $modelContent, $conversation->title, $requestedModelId, $actualModelUsed);
+                
+                if ($result['success']) {
+                    $exportResults[$requestedModelId] = $result;
+                }
+            }
+        }
+        
+        if (empty($exportResults)) {
+            return [
+                'success' => false,
+                'error' => 'No content found to export for selected models'
+            ];
+        }
+        
+        return [
+            'success' => true,
+            'results' => $exportResults
+        ];
+        
+    } catch (\Exception $e) {
+        Log::error('File export error: ' . $e->getMessage(), [
+            'trace' => $e->getTraceAsString()
+        ]);
+        
+        return [
+            'success' => false,
+            'error' => 'Failed to generate file: ' . $e->getMessage()
+        ];
+    }
+}
+
+/**
+ * Process a single model's export
+ */
+/**
+ * Process a single model's export
+ */
+private function processSingleExport($format, $modelContent, $conversationTitle, $panelModelId, $actualModelId)
+{
+    try {
+        // ✅ Add model identifier to content
+        $contentWithHeader = "# Generated by: " . $actualModelId . "\n\n" . $modelContent;
+        
+        // Try to extract table data first
+        $extractedData = $this->extractTableDataFromContent($contentWithHeader);
+        
+        $headers = null;
+        $data = null;
+        
+        if ($extractedData) {
+            // We have table data
+            $headers = $extractedData['headers'];
+            $data = $extractedData['data'];
+        }
+        
+        // Generate file for this model
+        $tempFile = null;
+        $cleanModelId = str_replace(['_smart_panel', '/', ':', '.'], ['', '_', '_', '_'], $panelModelId);
+        $fileName = 'chattermate_' . $cleanModelId . '_export_' . date('Y-m-d_His');
+        
+        switch ($format) {
+            case 'csv':
+                if (!$extractedData) {
+                    return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                }
+                $tempFile = $this->generateCSVFile($data, $headers);
+                $fileName .= '.csv';
+                break;
+                
+            case 'xlsx':
+                if (!$extractedData) {
+                    return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                }
+                $tempFile = $this->generateExcelFile($data, $headers);
+                $fileName .= '.xlsx';
+                break;
+                
+            case 'pdf':
+                // ✅ IMPROVED: Pass raw content to PDF generator for proper formatting
+                $tempFile = $this->generatePDFFile($data, $headers, $contentWithHeader);
+                $fileName .= '.pdf';
+                break;
+                
+            case 'docx':
+                if (!$extractedData) {
+                    return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                }
+                $tempFile = $this->generateDOCXFile($data, $headers);
+                $fileName .= '.docx';
+                break;
+                
+            case 'txt':
+                if ($extractedData) {
+                    $tempFile = $this->generateTXTFileFromTable($data, $headers);
+                } else {
+                    return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                }
+                $fileName .= '.txt';
+                break;
+                
+            case 'pptx':
+                if ($extractedData) {
+                    $tempFile = $this->generatePPTXFileFromTable($data, $headers, $conversationTitle . ' - ' . $actualModelId);
+                } else {
+                    $tempFile = $this->generatePPTXFileFromText($contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                }
+                $fileName .= '.pptx';
+                break;
+                
+            default:
+                return [
+                    'success' => false,
+                    'error' => 'Unsupported format: ' . $format
+                ];
+        }
+        
+        if (!$tempFile || !file_exists($tempFile)) {
+            Log::error("Failed to generate file for model: {$panelModelId}");
+            return [
+                'success' => false,
+                'error' => 'Failed to generate file'
+            ];
+        }
+        
+        // Upload to Azure
+        $downloadUrl = $this->uploadFileToAzure($tempFile, $fileName, $format);
+        
+        // Clean up temp file
+        unlink($tempFile);
+        
+        // ✅ Return result for this model
+        return [
+            'success' => true,
+            'download_url' => $downloadUrl,
+            'file_name' => $fileName,
+            'file_format' => strtoupper($format),
+            'rows' => isset($data) ? count($data) : 0,
+            'columns' => isset($headers) ? count($headers) : 0,
+            'model' => $panelModelId,
+            'actual_model' => $actualModelId
+        ];
+        
+    } catch (\Exception $e) {
+        Log::error('Single export error: ' . $e->getMessage(), [
+            'panel_model' => $panelModelId,
+            'actual_model' => $actualModelId
+        ]);
+        
+        return [
+            'success' => false,
+            'error' => 'Failed to process export: ' . $e->getMessage()
+        ];
+    }
+}
+
+/**
+ * Extract table data from content
+ */
+private function extractTableDataFromContent($content)
+{
+    // Try markdown tables first
+    if (preg_match('/\|(.+)\|/', $content)) {
+        $lines = explode("\n", $content);
+        $headers = [];
+        $tableData = [];
+        $inTable = false;
+        
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if (empty($line)) continue;
+            
+            // Check if line is a table row
+            if (preg_match('/^\|(.+)\|$/', $line)) {
+                // Remove outer pipes and split
+                $cells = array_map('trim', explode('|', trim($line, '|')));
+                
+                // Skip separator lines
+                if (preg_match('/^[\s\-:|\s]+$/', $line)) {
+                    $inTable = true;
+                    continue;
+                }
+                
+                if (empty($headers)) {
+                    // First row is headers
+                    $headers = $cells;
+                } elseif ($inTable) {
+                    // Data row
+                    $tableData[] = array_combine($headers, array_slice($cells, 0, count($headers)));
+                }
+            }
+        }
+        
+        if (!empty($headers) && !empty($tableData)) {
+            return ['headers' => $headers, 'data' => $tableData];
+        }
+    }
+    
+    // Try JSON arrays
+    if (preg_match('/```json\s*(\[[\s\S]*?\])\s*```/', $content, $matches)) {
+        try {
+            $jsonData = json_decode($matches[1], true);
+            if (is_array($jsonData) && !empty($jsonData) && is_array($jsonData[0])) {
+                $headers = array_keys($jsonData[0]);
+                return ['headers' => $headers, 'data' => $jsonData];
+            }
+        } catch (\Exception $e) {
+            // Continue to next method
+        }
+    }
+    
+    return null;
+}
+
+/**
+ * Export plain text content
+ */
+private function exportPlainText($format, $content, $title)
+{
+    $fileName = 'chattermate_export_' . date('Y-m-d_His');
+    $parsedown = new Parsedown();
+    
+    try {
+        switch ($format) {
+            case 'pdf':
+                // Generate PDF from markdown
+                $html = $parsedown->text($content);
+                $pdf = new TCPDF();
+                $pdf->AddPage();
+                $pdf->SetFont('helvetica', '', 11);
+                $pdf->writeHTML($html, true, false, true, false, '');
+                
+                $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.pdf';
+                $pdf->Output($tempFile, 'F');
+                $fileName .= '.pdf';
+                break;
+                
+            case 'docx':
+                // Generate DOCX from markdown
+                $phpWord = new PhpWord();
+                $section = $phpWord->addSection();
+                
+                // Add title
+                $section->addTitle($title, 1);
+                $section->addTextBreak(1);
+                
+                // Add content (simple paragraph)
+                $section->addText($content);
+                
+                $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.docx';
+                $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
+                $objWriter->save($tempFile);
+                $fileName .= '.docx';
+                break;
+                
+            case 'xlsx':
+                // Generate Excel with content
+                $spreadsheet = new Spreadsheet();
+                $sheet = $spreadsheet->getActiveSheet();
+                $sheet->setCellValue('A1', 'ChatterMate Export');
+                $sheet->setCellValue('A2', $title);
+                $sheet->setCellValue('A4', $content);
+                
+                $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.xlsx';
+                $writer = new Xlsx($spreadsheet);
+                $writer->save($tempFile);
+                $fileName .= '.xlsx';
+                break;
+                
+            case 'txt':
+                // Simple text file
+                $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.txt';
+                file_put_contents($tempFile, "ChatterMate Export\n" . $title . "\n\n" . $content);
+                $fileName .= '.txt';
+                break;
+                
+            case 'pptx':
+                // Generate PPTX from markdown content
+                // Since this is plain text content (not table), create a slide with text box
+                $tempFile = $this->generatePPTXFileFromText($content, $title);
+                $fileName .= '.pptx';
+                break;
+                
+            default:
+                return [
+                    'success' => false,
+                    'error' => 'Unsupported format for plain text export'
+                ];
+        }
+        
+        // Upload to Azure
+        $downloadUrl = $this->uploadFileToAzure($tempFile, $fileName, $format);
+        unlink($tempFile);
+        
+        return [
+            'success' => true,
+            'download_url' => $downloadUrl,
+            'file_name' => $fileName,
+            'file_format' => strtoupper($format),
+            'rows' => 1,
+            'columns' => 1
+        ];
+        
+    } catch (\Exception $e) {
+        Log::error('Plain text export error: ' . $e->getMessage());
+        return [
+            'success' => false,
+            'error' => 'Failed to generate file: ' . $e->getMessage()
+        ];
+    }
+}
+
+/**
+ * Generate CSV file from table data
+ */
+private function generateCSVFile($data, $headers)
+{
+    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.csv';
+    
+    $csv = Writer::createFromPath($tempFile, 'w+');
+    $csv->setDelimiter(',');
+    $csv->setEnclosure('"');
+    $csv->setOutputBOM(Writer::BOM_UTF8);
+    
+    // Write title row
+    $csv->insertOne(['ChatterMate AI Export']);
+    $csv->insertOne(['Generated: ' . date('Y-m-d H:i:s')]);
+    $csv->insertOne([]); // Empty row
+    
+    // Write headers
+    $csv->insertOne($headers);
+    
+    // Write data rows
+    foreach ($data as $row) {
+        if (is_array($row)) {
+            if (!empty($headers) && array_keys($row) !== range(0, count($row) - 1)) {
+                $csvRow = [];
+                foreach ($headers as $header) {
+                    $csvRow[] = $row[$header] ?? '';
+                }
+                $csv->insertOne($csvRow);
+            } else {
+                $csv->insertOne(array_values($row));
+            }
+        }
+    }
+    
+    return $tempFile;
+}
+
+/**
+ * Generate Excel file from table data
+ */
+private function generateExcelFile($data, $headers)
+{
+    $spreadsheet = new Spreadsheet();
+    $sheet = $spreadsheet->getActiveSheet();
+    $sheet->setTitle('ChatterMate Export');
+    
+    // Title section (rows 1-3)
+    $sheet->setCellValue('A1', 'ChatterMate AI Export');
+    $sheet->mergeCells('A1:' . chr(64 + count($headers)) . '1');
+    $sheet->getStyle('A1')->applyFromArray([
+        'font' => [
+            'bold' => true,
+            'size' => 16,
+            'color' => ['rgb' => '4F46E5'],
+        ],
+        'alignment' => [
+            'horizontal' => Alignment::HORIZONTAL_CENTER,
+        ],
+    ]);
+    
+    $sheet->setCellValue('A2', 'Generated: ' . date('F j, Y \a\t g:i A'));
+    $sheet->mergeCells('A2:' . chr(64 + count($headers)) . '2');
+    $sheet->getStyle('A2')->applyFromArray([
+        'font' => [
+            'size' => 10,
+            'color' => ['rgb' => '6B7280'],
+        ],
+        'alignment' => [
+            'horizontal' => Alignment::HORIZONTAL_CENTER,
+        ],
+    ]);
+    
+    $sheet->setCellValue('A3', 'Total Rows: ' . count($data));
+    $sheet->mergeCells('A3:' . chr(64 + count($headers)) . '3');
+    $sheet->getStyle('A3')->applyFromArray([
+        'font' => [
+            'size' => 10,
+            'italic' => true,
+            'color' => ['rgb' => '6B7280'],
+        ],
+        'alignment' => [
+            'horizontal' => Alignment::HORIZONTAL_CENTER,
+        ],
+    ]);
+    
+    // Header row (row 5)
+    $headerStyle = [
+        'font' => [
+            'bold' => true,
+            'color' => ['rgb' => 'FFFFFF'],
+            'size' => 12,
+        ],
+        'fill' => [
+            'fillType' => Fill::FILL_SOLID,
+            'startColor' => ['rgb' => '4F46E5'],
+        ],
+        'alignment' => [
+            'horizontal' => Alignment::HORIZONTAL_CENTER,
+            'vertical' => Alignment::VERTICAL_CENTER,
+        ],
+        'borders' => [
+            'allBorders' => [
+                'borderStyle' => Border::BORDER_THIN,
+                'color' => ['rgb' => '000000'],
+            ],
+        ],
+    ];
+    
+    $col = 'A';
+    foreach ($headers as $header) {
+        $sheet->setCellValue($col . '5', $header);
+        $sheet->getStyle($col . '5')->applyFromArray($headerStyle);
+        $sheet->getColumnDimension($col)->setAutoSize(true);
+        $col++;
+    }
+    
+    // Data rows (starting from row 6)
+    $row = 6;
+    foreach ($data as $dataRow) {
+        $col = 'A';
+        foreach ($headers as $header) {
+            $value = is_array($dataRow) ? ($dataRow[$header] ?? '') : $dataRow;
+            $sheet->setCellValue($col . $row, $value);
+            
+            // Apply data cell styling
+            $sheet->getStyle($col . $row)->applyFromArray([
+                'borders' => [
+                    'allBorders' => [
+                        'borderStyle' => Border::BORDER_THIN,
+                        'color' => ['rgb' => 'E5E7EB'],
+                    ],
+                ],
+                'alignment' => [
+                    'vertical' => Alignment::VERTICAL_TOP,
+                    'wrapText' => true,
+                ],
+            ]);
+            
+            $col++;
+        }
+        
+        // Alternating row colors
+        if ($row % 2 == 0) {
+            $sheet->getStyle('A' . $row . ':' . chr(64 + count($headers)) . $row)
+                ->getFill()
+                ->setFillType(Fill::FILL_SOLID)
+                ->getStartColor()->setRGB('F9FAFB');
+        }
+        
+        $row++;
+    }
+    
+    // Freeze header row
+    $sheet->freezePane('A6');
+    
+    // Add footer
+    $sheet->getHeaderFooter()->setOddFooter('&L&B' . 'ChatterMate AI' . '&RPage &P of &N');
+    
+    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.xlsx';
+    $writer = new Xlsx($spreadsheet);
+    $writer->save($tempFile);
+    
+    return $tempFile;
+}
+
+/**
+ * Generate TXT file from table data
+ */
+private function generateTXTFileFromTable($data, $headers)
+{
+    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.txt';
+    $content = "ChatterMate Export - Table Data\n\n";
+    
+    // Add headers
+    $content .= implode(" | ", $headers) . "\n";
+    $content .= str_repeat("-", 50) . "\n";
+    
+    // Add data
+    foreach ($data as $row) {
+        $rowValues = [];
+        foreach ($headers as $header) {
+            $rowValues[] = $row[$header] ?? '';
+        }
+        $content .= implode(" | ", $rowValues) . "\n";
+    }
+    
+    file_put_contents($tempFile, $content);
+    return $tempFile;
+}
+
+/**
+ * Generate PPTX file from Text
+ * Uses PHPPresentation if available, otherwise fallback or error
+ */
+private function generatePPTXFileFromText($content, $title)
+{
+    // Check if class exists (assuming phpoffice/phppresentation might not be installed)
+    if (!class_exists('\PhpOffice\PhpPresentation\PhpPresentation')) {
+        return $this->createBasicPPTX($content, $title);
+    }
+    
+    // If library exists:
+    $objPHPPowerPoint = new \PhpOffice\PhpPresentation\PhpPresentation();
+    $currentSlide = $objPHPPowerPoint->getActiveSlide();
+
+    // Create a shape (text)
+    $shape = $currentSlide->createRichTextShape()
+        ->setHeight(600)
+        ->setWidth(900)
+        ->setOffsetX(10)
+        ->setOffsetY(10);
+    $shape->getActiveParagraph()->getAlignment()->setHorizontal( \PhpOffice\PhpPresentation\Style\Alignment::HORIZONTAL_CENTER );
+    $textRun = $shape->createTextRun($title);
+    $textRun->getFont()->setBold(true)->setSize(28)->setColor( new \PhpOffice\PhpPresentation\Style\Color( 'FF000000' ) );
+
+    // Content
+    $shape2 = $currentSlide->createRichTextShape()
+        ->setHeight(600)
+        ->setWidth(900)
+        ->setOffsetX(10)
+        ->setOffsetY(100);
+    $shape2->createTextRun(substr($content, 0, 1000)); // Limit text per slide
+
+    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.pptx';
+    $oWriterPPTX = \PhpOffice\PhpPresentation\IOFactory::createWriter($objPHPPowerPoint, 'PowerPoint2007');
+    $oWriterPPTX->save($tempFile);
+    
+    return $tempFile;
+}
+
+/**
+ * Generate PPTX file from Table
+ */
+private function generatePPTXFileFromTable($data, $headers, $title)
+{
+     // Reuse text logic for now but format as table if library exists
+     $content = "Table Data:\n" . implode(" | ", $headers) . "\n...\n(See extracted data)";
+     return $this->generatePPTXFileFromText($content, $title);
+}
+
+
+/**
+ * Minimal PPTX Generator (No Library Fallback)
+ */
+private function createBasicPPTX($content, $title)
+{
+    // Minimal error message if library is missing, as manual PPTX creation is too complex for this scope
+    throw new \Exception("PPTX Export requires 'phpoffice/phppresentation'. Please install it via composer.");
+}
+
+/**
+ * Generate PDF file from table data
+ */
+/**
+ * Generate PDF file from table data OR markdown content
+ */
+private function generatePDFFile($data, $headers, $rawContent = null)
+{
+    $pdf = new TCPDF(PDF_PAGE_ORIENTATION, PDF_UNIT, PDF_PAGE_FORMAT, true, 'UTF-8', false);
+    
+    // Document information
+    $pdf->SetCreator('ChatterMate AI');
+    $pdf->SetAuthor('ChatterMate AI');
+    $pdf->SetTitle('ChatterMate Export - ' . date('Y-m-d'));
+    $pdf->SetSubject('Data Export');
+    $pdf->SetKeywords('ChatterMate, AI, Export, Data');
+    
+    // Custom header
+    $pdf->SetHeaderData('', 0, 'ChatterMate AI Export', 'Generated: ' . date('F j, Y \a\t g:i A'));
+    
+    // Header and footer fonts
+    $pdf->setHeaderFont([PDF_FONT_NAME_MAIN, '', 11]);
+    $pdf->setFooterFont([PDF_FONT_NAME_DATA, '', 8]);
+    
+    // Margins
+    $pdf->SetMargins(15, 27, 15);
+    $pdf->SetHeaderMargin(5);
+    $pdf->SetFooterMargin(10);
+    
+    // Auto page breaks
+    $pdf->SetAutoPageBreak(TRUE, 25);
+    
+    // Add page
+    $pdf->AddPage();
+    
+    // ✅ Enhanced CSS for better formatting
+    $styles = '
+    <style>
+        body {
+            font-family: helvetica;
+            font-size: 11px;
+            line-height: 1.6;
+            color: #333333;
+        }
+        h1 {
+            color: #4F46E5;
+            font-size: 24px;
+            font-weight: bold;
+            margin-top: 20px;
+            margin-bottom: 15px;
+            padding-bottom: 8px;
+            border-bottom: 3px solid #4F46E5;
+        }
+        h2 {
+            color: #6366F1;
+            font-size: 20px;
+            font-weight: bold;
+            margin-top: 18px;
+            margin-bottom: 12px;
+            padding-bottom: 5px;
+            border-bottom: 2px solid #E0E7FF;
+        }
+        h3 {
+            color: #818CF8;
+            font-size: 16px;
+            font-weight: bold;
+            margin-top: 15px;
+            margin-bottom: 10px;
+        }
+        h4, h5, h6 {
+            color: #A5B4FC;
+            font-size: 14px;
+            font-weight: bold;
+            margin-top: 12px;
+            margin-bottom: 8px;
+        }
+        p {
+            margin-top: 5px;
+            margin-bottom: 10px;
+            text-align: justify;
+            white-space: pre-wrap;
+        }
+        strong, b {
+            font-weight: bold;
+            color: #1F2937;
+        }
+        em, i {
+            font-style: italic;
+            color: #4B5563;
+        }
+        ul, ol {
+            margin-left: 20px;
+            margin-top: 8px;
+            margin-bottom: 12px;
+        }
+        li {
+            margin-bottom: 5px;
+            line-height: 1.5;
+        }
+        code {
+            background-color: #F3F4F6;
+            color: #DC2626;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: courier;
+            font-size: 10px;
+        }
+        pre {
+            background-color: #1F2937;
+            color: #F9FAFB;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 15px 0;
+            overflow-x: auto;
+            font-family: courier;
+            font-size: 9px;
+            line-height: 1.4;
+            border-left: 4px solid #4F46E5;
+            white-space: pre-wrap;
+        }
+        pre code {
+            background-color: transparent;
+            color: #F9FAFB;
+            padding: 0;
+        }
+        blockquote {
+            border-left: 4px solid #4F46E5;
+            padding-left: 15px;
+            margin: 15px 0;
+            color: #6B7280;
+            font-style: italic;
+            background-color: #F9FAFB;
+            padding: 10px 15px;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 15px 0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        th {
+            background-color: #4F46E5;
+            color: #FFFFFF;
+            font-weight: bold;
+            padding: 12px 10px;
+            text-align: left;
+            border: 1px solid #3730A3;
+            font-size: 11px;
+        }
+        td {
+            padding: 10px;
+            border: 1px solid #E5E7EB;
+            font-size: 10px;
+            vertical-align: top;
+        }
+        tr:nth-child(even) {
+            background-color: #F9FAFB;
+        }
+        tr:nth-child(odd) {
+            background-color: #FFFFFF;
+        }
+        tr:hover {
+            background-color: #F3F4F6;
+        }
+        hr {
+            border: none;
+            border-top: 2px solid #E5E7EB;
+            margin: 20px 0;
+        }
+        a {
+            color: #4F46E5;
+            text-decoration: underline;
+        }
+        .highlight {
+            background-color: #FEF3C7;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+    </style>';
+    
+    // ✅ If we have raw markdown content, convert it
+    if ($rawContent) {
+        // ✅ CLEAN VERSION: No placeholders needed
+        // Parse markdown to HTML with line breaks enabled
+        $parsedown = new \Parsedown();
+        $parsedown->setBreaksEnabled(true); // ✅ This preserves line breaks
+        $html = $parsedown->text($rawContent);
+        
+        // Apply styles and write
+        $pdf->SetFont('helvetica', '', 11);
+        $pdf->writeHTML($styles . $html, true, false, true, false, '');
+        
+    } else if (!empty($data) && !empty($headers)) {
+        // ✅ Table mode with enhanced styling
+        $pdf->SetFont('helvetica', '', 9);
+        
+        $tableHtml = $styles . '<table>';
+        
+        // Headers
+        $tableHtml .= '<thead><tr>';
+        foreach ($headers as $header) {
+            $tableHtml .= '<th>' . htmlspecialchars($header) . '</th>';
+        }
+        $tableHtml .= '</tr></thead><tbody>';
+        
+        // Data rows
+        foreach ($data as $row) {
+            $tableHtml .= '<tr>';
+            foreach ($headers as $header) {
+                $value = is_array($row) ? ($row[$header] ?? '') : $row;
+                // ✅ Preserve line breaks in table cells too
+                $value = nl2br(htmlspecialchars($value));
+                $tableHtml .= '<td>' . $value . '</td>';
+            }
+            $tableHtml .= '</tr>';
+        }
+        
+        $tableHtml .= '</tbody></table>';
+        
+        $pdf->writeHTML($tableHtml, true, false, true, false, '');
+    }
+    
+    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.pdf';
+    $pdf->Output($tempFile, 'F');
+    
+    return $tempFile;
+}
+
+/**
+ * Generate DOCX file from table data
+ */
+private function generateDOCXFile($data, $headers)
+{
+    $phpWord = new PhpWord();
+    
+    // Set document properties
+    $properties = $phpWord->getDocInfo();
+    $properties->setCreator('ChatterMate AI');
+    $properties->setCompany('ChatterMate');
+    $properties->setTitle('ChatterMate Export');
+    $properties->setDescription('Generated by ChatterMate AI');
+    $properties->setCategory('Data Export');
+    $properties->setCreated(time());
+    
+    $section = $phpWord->addSection([
+        'marginLeft' => 1000,
+        'marginRight' => 1000,
+        'marginTop' => 1000,
+        'marginBottom' => 1000,
+    ]);
+    
+    // Add title
+    $section->addText(
+        'ChatterMate AI Export',
+        [
+            'name' => 'Arial',
+            'size' => 18,
+            'bold' => true,
+            'color' => '4F46E5'
+        ],
+        [
+            'alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER,
+            'spaceAfter' => 200
+        ]
+    );
+    
+    // Add metadata
+    $section->addText(
+        'Generated: ' . date('F j, Y \a\t g:i A'),
+        [
+            'name' => 'Arial',
+            'size' => 10,
+            'color' => '6B7280'
+        ],
+        [
+            'alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER,
+            'spaceAfter' => 100
+        ]
+    );
+    
+    $section->addText(
+        'Total Rows: ' . count($data),
+        [
+            'name' => 'Arial',
+            'size' => 10,
+            'italic' => true,
+            'color' => '6B7280'
+        ],
+        [
+            'alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER,
+            'spaceAfter' => 300
+        ]
+    );
+    
+    // Create table
+    $tableStyle = [
+        'borderSize' => 6,
+        'borderColor' => 'E5E7EB',
+        'cellMargin' => 80,
+        'alignment' => \PhpOffice\PhpWord\SimpleType\JcTable::CENTER,
+    ];
+    
+    $headerStyle = [
+        'bold' => true,
+        'color' => 'FFFFFF',
+        'size' => 11,
+        'name' => 'Arial'
+    ];
+    
+    $headerCellStyle = [
+        'bgColor' => '4F46E5',
+        'valign' => 'center'
+    ];
+    
+    $cellStyle = [
+        'valign' => 'top'
+    ];
+    
+    $table = $section->addTable($tableStyle);
+    
+    // Add header row
+    $table->addRow(400);
+    foreach ($headers as $header) {
+        $cell = $table->addCell(2000, $headerCellStyle);
+        $cell->addText(htmlspecialchars($header), $headerStyle, ['alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER]);
+    }
+    
+    // Add data rows
+    foreach ($data as $index => $row) {
+        $table->addRow();
+        
+        // Alternating row colors
+        $rowCellStyle = $cellStyle;
+        if ($index % 2 == 0) {
+            $rowCellStyle['bgColor'] = 'F9FAFB';
+        }
+        
+        foreach ($headers as $header) {
+            $value = is_array($row) ? ($row[$header] ?? '') : $row;
+            $cell = $table->addCell(2000, $rowCellStyle);
+            $cell->addText(
+                htmlspecialchars($value),
+                ['name' => 'Arial', 'size' => 10]
+            );
+        }
+    }
+    
+    // Add footer
+    $footer = $section->addFooter();
+    $footer->addPreserveText(
+        'ChatterMate AI | Page {PAGE} of {NUMPAGES}',
+        ['size' => 9, 'color' => '6B7280'],
+        ['alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER]
+    );
+    
+    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.docx';
+    $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
+    $objWriter->save($tempFile);
+    
+    return $tempFile;
+}
+
+/**
+ * Upload file to Azure Blob Storage
+ */
+private function uploadFileToAzure($tempFile, $fileName, $format)
+{
+    try {
+        $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
+        $containerName = config('filesystems.disks.azure.container');
+        
+        $azureFileName = 'chattermate-exports/' . $fileName;
+        $fileContent = file_get_contents($tempFile);
+        
+        // Set content type based on format
+        $contentTypes = [
+            'csv' => 'text/csv',
+            'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'pdf' => 'application/pdf',
+            'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        ];
+        
+        $options = new CreateBlockBlobOptions();
+        $options->setContentType($contentTypes[$format] ?? 'application/octet-stream');
+        
+        $blobClient->createBlockBlob($containerName, $azureFileName, $fileContent, $options);
+        
+        $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
+        return "{$baseUrl}/{$containerName}/{$azureFileName}";
+        
+    } catch (\Exception $e) {
+        Log::error('Azure upload failed: ' . $e->getMessage());
+        throw $e;
+    }
+}
+
+/**
+ * Upload table CSV (for inline table exports)
+ */
+public function uploadTableCSV(Request $request)
+{
+    try {
+        $file = $request->file('csv_file');
+        
+        if (!$file) {
+            return response()->json(['success' => false, 'error' => 'No file uploaded'], 400);
+        }
+        
+        $fileName = 'table_' . time() . '.csv';
+        $azureFileName = 'chattermate-exports/' . $fileName;
+        
+        $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
+        $containerName = config('filesystems.disks.azure.container');
+        
+        $options = new CreateBlockBlobOptions();
+        $options->setContentType('text/csv');
+        
+        $blobClient->createBlockBlob(
+            $containerName, 
+            $azureFileName, 
+            file_get_contents($file->getRealPath()),
+            $options
+        );
+        
+        $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
+        $downloadUrl = "{$baseUrl}/{$containerName}/{$azureFileName}";
+        
+        return response()->json([
+            'success' => true,
+            'download_url' => $downloadUrl,
+            'file_name' => $fileName
+        ]);
+        
+    } catch (\Exception $e) {
+        Log::error('Table CSV upload failed: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'error' => 'Upload failed: ' . $e->getMessage()
+        ], 500);
+    }
+}
+
+/**
+ * Export table inline (from frontend table data)
+ */
+public function exportTableInline(Request $request)
+{
+    try {
+        $request->validate([
+            'format' => 'required|in:csv,xlsx,pdf,docx',
+            'headers' => 'required|array',
+            'data' => 'required|array',
+        ]);
+        
+        $format = $request->input('format');
+        $headers = $request->input('headers');
+        $data = $request->input('data');
+        
+        // Generate file
+        $tempFile = null;
+        $fileName = 'table_export_' . date('Y-m-d_His');
+        
+        switch ($format) {
+            case 'csv':
+                $tempFile = $this->generateCSVFile($data, $headers);
+                $fileName .= '.csv';
+                break;
+                
+            case 'xlsx':
+                $tempFile = $this->generateExcelFile($data, $headers);
+                $fileName .= '.xlsx';
+                break;
+                
+            case 'pdf':
+                $tempFile = $this->generatePDFFile($data, $headers);
+                $fileName .= '.pdf';
+                break;
+                
+            case 'docx':
+                $tempFile = $this->generateDOCXFile($data, $headers);
+                $fileName .= '.docx';
+                break;
+        }
+        
+        // Upload to Azure
+        $downloadUrl = $this->uploadFileToAzure($tempFile, $fileName, $format);
+        
+        // Clean up
+        unlink($tempFile);
+        
+        return response()->json([
+            'success' => true,
+            'download_url' => $downloadUrl,
+            'file_name' => $fileName
+        ]);
+        
+    } catch (\Exception $e) {
+        Log::error('Inline table export error: ' . $e->getMessage());
+        return response()->json([
+            'success' => false,
+            'error' => 'Failed to export: ' . $e->getMessage()
+        ], 500);
+    }
+}
+
+/**
+ * Detect WHAT content to export from the request
+ */
+private function detectExportContentReference($message)
+{
+    $message = strtolower(trim($message));
+    
+    // Content type keywords
+    $contentTypes = [
+        'code' => ['code', 'script', 'program', 'function', 'algorithm'],
+        'poem' => ['poem', 'poetry', 'verse'],
+        'song' => ['song', 'lyrics', 'music'],
+        'table' => ['table', 'data', 'chart', 'spreadsheet'],
+        'list' => ['list', 'items', 'points'],
+        'story' => ['story', 'narrative', 'tale'],
+        'essay' => ['essay', 'article', 'writing'],
+    ];
+    
+    // Position references
+    $positions = [
+        'this' => 0,      // Current/last message
+        'that' => 0,      // Current/last message
+        'above' => 0,     // Message right before export request
+        'previous' => 0,  // Message right before export request
+        'first' => 'first',
+        'second' => 'second',
+        'last' => 0,
+    ];
+    
+    $result = [
+        'content_type' => null,
+        'position' => 0,  // 0 = last matching message, 'first' = first matching, 'second' = second matching
+    ];
+    
+    // Check for content type references
+    foreach ($contentTypes as $type => $keywords) {
+        foreach ($keywords as $keyword) {
+            if (str_contains($message, $keyword)) {
+                $result['content_type'] = $type;
+                Log::info("Content type detected: {$type}");
+                break 2;
+            }
+        }
+    }
+    
+    // Check for position references
+    foreach ($positions as $keyword => $position) {
+        if (str_contains($message, $keyword)) {
+            $result['position'] = $position;
+            Log::info("Position reference detected: {$keyword}");
+            break;
+        }
+    }
+    
+    return $result;
+}
+
+/**
+ * Identify content type of a message
+ */
+private function identifyContentType($content)
+{
+    $types = [];
+    
+    // Check for code blocks
+    if (preg_match('/```[\s\S]*?```/', $content) || 
+        preg_match('/\b(function|class|def|const|var|let|if|else|for|while)\b/', $content)) {
+        $types[] = 'code';
+    }
+    
+    // Check for tables
+    if (preg_match('/\|(.+)\|/', $content)) {
+        $types[] = 'table';
+    }
+    
+    // Check for poem structure (short lines, potential rhyme)
+    $lines = explode("\n", $content);
+    $shortLines = array_filter($lines, fn($line) => strlen(trim($line)) > 0 && strlen(trim($line)) < 60);
+    if (count($shortLines) > 4 && count($shortLines) / max(count($lines), 1) > 0.5) {
+        $types[] = 'poem';
+    }
+    
+    // Check for song/lyrics (verse, chorus, etc.)
+    if (preg_match('/\b(verse|chorus|bridge|refrain|intro|outro)\b/i', $content)) {
+        $types[] = 'song';
+    }
+    
+    // Check for lists
+    if (preg_match('/^[\s]*[-*•]\s+/m', $content) || preg_match('/^\d+\.\s+/m', $content)) {
+        $types[] = 'list';
+    }
+    
+    return $types;
+}
+
+/**
+ * Find the right message to export based on user's request
+ */
+private function findMessageToExport($conversation, $contentReference, $currentMessageId = null)
+{
+    // Get all assistant messages (excluding the current export request)
+    $messages = $conversation->messages()
+        ->where('role', 'assistant')
+        ->where('id', '!=', $currentMessageId)
+        ->orderBy('created_at', 'desc')
+        ->get();
+    
+    if ($messages->isEmpty()) {
+        return null;
+    }
+    
+    // If no specific content type requested, return the last message
+    if (!$contentReference['content_type']) {
+        Log::info("No content type specified, using last message");
+        return $messages->first();
+    }
+    
+    $targetType = $contentReference['content_type'];
+    $position = $contentReference['position'];
+    
+    Log::info("Searching for content", [
+        'type' => $targetType,
+        'position' => $position,
+        'total_messages' => $messages->count()
+    ]);
+    
+    // Find messages with matching content type
+    $matchingMessages = [];
+    foreach ($messages as $message) {
+        $content = '';
+        
+        // Get content from all_responses
+        if ($message->all_responses) {
+            // Remove 'files' key if exists
+            $responses = $message->all_responses;
+            unset($responses['files']);
+            
+            // Get first actual response
+            $actualResponses = array_filter($responses, function($key) {
+                return $key !== 'export' && $key !== 'files';
+            }, ARRAY_FILTER_USE_KEY);
+            
+            if (!empty($actualResponses)) {
+                $content = reset($actualResponses);
+            }
+        } else {
+            $content = $message->content ?? '';
+        }
+        
+        // Identify content types in this message
+        $messageTypes = $this->identifyContentType($content);
+        
+        Log::info("Message analysis", [
+            'message_id' => $message->id,
+            'detected_types' => $messageTypes,
+            'content_preview' => substr($content, 0, 100)
+        ]);
+        
+        // Check if this message contains the target type
+        if (in_array($targetType, $messageTypes)) {
+            $matchingMessages[] = $message;
+        }
+    }
+    
+    if (empty($matchingMessages)) {
+        Log::warning("No messages found with content type: {$targetType}, falling back to last message");
+        return $messages->first();
+    }
+    
+    // Handle position
+    if ($position === 'first') {
+        $selected = end($matchingMessages); // Last in array = first chronologically
+        Log::info("Selected first {$targetType} message", ['id' => $selected->id]);
+        return $selected;
+    } else if ($position === 'second' && count($matchingMessages) >= 2) {
+        $selected = $matchingMessages[count($matchingMessages) - 2];
+        Log::info("Selected second {$targetType} message", ['id' => $selected->id]);
+        return $selected;
+    } else {
+        $selected = $matchingMessages[0]; // First in array = last chronologically
+        Log::info("Selected last {$targetType} message", ['id' => $selected->id]);
+        return $selected;
+    }
+}
+
+

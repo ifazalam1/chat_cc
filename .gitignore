@@ -1,0 +1,10 @@
+/vendor
+/node_modules
+/storage/*.key
+/storage/logs
+/storage/framework
+.env
+/.env.*
+/bootstrap/cache/*
+.idea
+.vscode
