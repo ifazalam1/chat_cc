@@ -5711,7 +5711,7 @@
                             // ✅ Save hex_code to localStorage so conversation persists on refresh
                             localStorage.setItem('multi_compare_current_hex_code', data.hex_code);
                             // ✅ Update URL without page reload
-                            const newUrl = `{{ url('/chattermate-compare') }}/${data.hex_code}`;
+                            const newUrl = `{{ url('/') }}/${data.hex_code}`;
                             window.history.pushState({ hexCode: data.hex_code }, '', newUrl);
                         }
                     
