@@ -137,481 +137,6 @@ class CompareController extends Controller
         return $mimeTypes[$extension] ?? 'image/jpeg';
     }
 
-    public function chat(Request $request)
-    {
-        set_time_limit(300);
-        
-        Log::debug('Full incoming request', [
-            'all' => $request->all(),
-            'hasFile' => $request->hasFile('pdf'),
-            'web_search' => $request->boolean('web_search'),
-            'create_image' => $request->boolean('create_image'),
-            'auto_optimize_model' => $request->boolean('auto_optimize_model'),  // ✅ NEW
-            'allow_cross_provider' => $request->boolean('allow_cross_provider'), // ✅ NEW
-        ]);
-
-        $editingMessageId = $request->input('editing_message_id');
-        $isEditing = !empty($editingMessageId);
-
-        $request->validate([
-            'message' => 'required|string',
-            'conversation_id' => 'nullable|exists:chat_conversations,id',
-            'pdf' => 'nullable|file|mimes:pdf,doc,docx,png,jpg,jpeg,webp,gif|max:10240',
-            'create_image' => 'sometimes|boolean',
-            'auto_optimize_model' => 'sometimes|boolean',      // ✅ NEW
-            'allow_cross_provider' => 'sometimes|boolean',     // ✅ NEW
-        ]);
-
-        if ($isEditing && $request->conversation_id) {
-            ChatMessage::where('conversation_id', $request->conversation_id)
-                ->where('role', 'assistant')
-                ->where('id', $editingMessageId)
-                ->delete();
-        }
-
-        $user = auth()->user();
-        $openaiModel = $user->selected_model;
-        $useWebSearch = $request->boolean('web_search');
-        $createImage = $request->boolean('create_image');
-        $expert = null;
-        $systemMessage = AIAction::getSystemMessage('chattermate_system_message');
-        log::info('Base system message retrieved', ['system_message' => substr($systemMessage, 0, 100) . '...']);
-        
-        // Check if current model is Claude
-        $isCurrentModelClaude = $this->isClaudeModel($openaiModel);
-
-        // ✅ Analyze query complexity early
-        $complexityScore = \App\Services\AI\QueryComplexityAnalyzer::analyze($request->message);
-        $complexityFeatures = \App\Services\AI\QueryComplexityAnalyzer::extractFeatures($request->message);
-        
-        Log::info('Query Complexity Analysis', [
-            'query' => substr($request->message, 0, 100) . '...',
-            'complexity_score' => $complexityScore,
-            'features' => $complexityFeatures,
-            'user_selected_model' => $openaiModel,
-            'user_plan' => $user->plan?->name,
-            'user_accessible_models' => $user->aiModels()
-        ]);
-
-        // Handle Expert Selection (UNCHANGED)
-        if ($request->filled('expert_id')) {
-            $expert = Expert::find($request->expert_id);
-            if ($expert) {
-                $systemMessage = $expert->expertise;
-                
-                $documents = $expert->documents;
-                if ($documents->isNotEmpty()) {
-                    $documentContext = "\n\nExpert Document Context:";
-                    foreach ($documents as $doc) {
-                        if (!empty($doc->content)) {
-                            $documentContext .= "\n\n[From {$doc->file_name}]:\n" . 
-                                            substr($doc->content, 0, 2000);
-                        }
-                    }
-                    $systemMessage .= $documentContext;
-                }
-                
-                if (!$request->conversation_id) {
-                    $conversation = ChatConversation::create([
-                        'user_id' => $user->id,
-                        'expert_id' => $expert->id,
-                        'title' => $expert->name . ' Chat'
-                    ]);
-                    $request->merge(['conversation_id' => $conversation->id]);
-                }
-            }
-        }
-
-        // Handle Image Generation (UNCHANGED)
-        if ($createImage) {
-            if ($isCurrentModelClaude) {
-                return response()->json([
-                    'error' => 'Image generation is not supported with Claude models. Please switch to an OpenAI model.'
-                ], 400);
-            }
-            return $this->handleImageGeneration($request, $user);
-        }
-
-        // ✅✅✅ NEW: Get suggested model based on complexity and cross-provider setting ✅✅✅
-        $autoOptimizeEnabled = $request->boolean('auto_optimize_model', true); // default true
-        $allowCrossProvider = $request->boolean('allow_cross_provider', false); // default false
-
-        Log::debug('Model optimization settings', [
-            'auto_optimize_enabled' => $autoOptimizeEnabled,
-            'allow_cross_provider' => $allowCrossProvider,
-            'current_model' => $openaiModel,
-            'current_provider' => $this->getModelProvider($openaiModel)
-        ]);
-
-        // Get suggested model based on cross-provider setting
-        $suggestedModel = $allowCrossProvider 
-            ? $this->getSuggestedModelFromAnyProvider($complexityScore, $openaiModel, $user)
-            : $this->getSuggestedModelFromComplexity($complexityScore, $openaiModel, $user);
-
-        Log::info('Model suggestion', [
-            'suggested_model' => $suggestedModel,
-            'suggested_provider' => $this->getModelProvider($suggestedModel),
-            'current_model' => $openaiModel,
-            'current_provider' => $this->getModelProvider($openaiModel),
-            'cross_provider_enabled' => $allowCrossProvider,
-            'suggestion_reason' => $suggestedModel !== $openaiModel ? 'Complexity-based suggestion' : 'Current model optimal'
-        ]);
-
-        // Model selection with web search handling
-        if ($useWebSearch) {
-            if ($isCurrentModelClaude) {
-                // Claude: Use the selected Claude model with search tools
-                $modelToUse = $openaiModel;
-                
-                if ($systemMessage) {
-                    $systemMessage .= "\n\nYou have access to web search capabilities. When needed, you can search for current information, recent events, and real-time data. Always cite your sources when providing information from the web.";
-                } else {
-                    $systemMessage = "You are a helpful AI assistant with access to web search. When answering questions, you can search for current information, recent events, and real-time data. Always cite your sources when providing information from the web.";
-                }
-                
-                Log::debug('Web search enabled for Claude model', ['model' => $modelToUse]);
-                
-            } elseif ($this->isGeminiModel($openaiModel)) {
-                // Gemini: Use the selected Gemini model with search grounding
-                $modelToUse = $openaiModel;
-                
-                if ($systemMessage) {
-                    $systemMessage .= "\n\nYou have access to Google Search grounding. When needed, you can search for current information, recent events, and real-time data. Always cite your sources when providing information from the web.";
-                } else {
-                    $systemMessage = "You are a helpful AI assistant with access to Google Search grounding. When answering questions, you can search for current information, recent events, and real-time data. Always cite your sources when providing information from the web.";
-                }
-                
-                Log::debug('Web search (grounding) enabled for Gemini model', ['model' => $modelToUse]);
-                
-            } elseif ($this->isGrokModel($openaiModel)) {
-                // Grok: Use the selected Grok model with Live Search
-                $modelToUse = $openaiModel;
-                
-                if ($systemMessage) {
-                    $systemMessage .= "\n\nYou have access to real-time Live Search capabilities. When needed, you can search for current information, recent events, and real-time data from the web and X (Twitter). Always cite your sources when providing information from the web.";
-                } else {
-                    $systemMessage = "You are a helpful AI assistant with access to real-time Live Search. When answering questions, you can search for current information, recent events, and real-time data from the web and X (Twitter). Always cite your sources when providing information from the web.";
-                }
-                
-                Log::debug('Live Search enabled for Grok model', ['model' => $modelToUse]);
-                
-            } else {
-                // OpenAI: Switch to the search-enabled model
-                $modelToUse = 'gpt-4o-search-preview';
-                Log::debug('Web search enabled, switching to OpenAI search model', [
-                    'original_model' => $openaiModel,
-                    'search_model' => $modelToUse
-                ]);
-            }
-        } else {
-            // ✅✅✅ UPDATED: Apply smart model selection with cross-provider support ✅✅✅
-            $modelToUse = $autoOptimizeEnabled 
-                ? $this->applySmartModelSelection(
-                    $openaiModel,      // User's selected model
-                    $suggestedModel,   // AI-suggested model based on complexity
-                    $complexityScore,  // Complexity score (0-100)
-                    $user,             // User object for plan/access control
-                    $allowCrossProvider // ✅ NEW: Allow cross-provider switching
-                )
-                : $openaiModel; // Just use the selected model if auto-optimize is disabled
-
-            Log::info('Model selection decision', [
-                'auto_optimize_enabled' => $autoOptimizeEnabled,
-                'cross_provider_enabled' => $allowCrossProvider,
-                'user_selected' => $openaiModel,
-                'user_selected_provider' => $this->getModelProvider($openaiModel),
-                'ai_suggested' => $suggestedModel,
-                'ai_suggested_provider' => $this->getModelProvider($suggestedModel),
-                'final_decision' => $modelToUse,
-                'final_provider' => $this->getModelProvider($modelToUse),
-                'complexity_score' => $complexityScore,
-                'model_changed' => $openaiModel !== $modelToUse,
-                'provider_switched' => $this->getModelProvider($openaiModel) !== $this->getModelProvider($modelToUse),
-                'reason' => $autoOptimizeEnabled 
-                    ? ($allowCrossProvider ? 'Cross-provider optimization applied' : 'Same-provider optimization applied')
-                    : 'Auto-optimization disabled - using user selection'
-            ]);
-
-            // ✅ Notify user if model or provider was changed
-            if ($openaiModel !== $modelToUse) {
-                $providerChanged = $this->getModelProvider($openaiModel) !== $this->getModelProvider($modelToUse);
-                
-                Log::notice('Model changed by smart selection', [
-                    'user_id' => $user->id,
-                    'from' => $openaiModel,
-                    'from_provider' => $this->getModelProvider($openaiModel),
-                    'to' => $modelToUse,
-                    'to_provider' => $this->getModelProvider($modelToUse),
-                    'provider_switched' => $providerChanged,
-                    'reason' => $complexityScore < 25 
-                        ? 'Query too simple for premium model' 
-                        : ($allowCrossProvider ? 'Cross-provider optimization' : 'Same-provider optimization')
-                ]);
-            }
-        }
-
-        // Detect if user needs math assistance
-        $needsMath = preg_match('/\b(math|equation|formula|calculate|integral|integrate|integration|derivative|differentiate|differentiation|sum|algebra|geometry|trigonometry|calculus|solve|sqrt|fraction|logarithm|log|ln|sin|cos|tan|exp|factorial|permutation|combination|matrix|vector|polar|cartesian|limit|limits|simplify|expand|factor|polynomial|quadratic|cubic)\b/i', $request->message) || preg_match('/[\^\+\-\*\/\=\(\)\[\]\\\\\{\}%<>!|,:\'\.]/', $request->message);
-
-        // Detect if user needs charts
-        $needsVisualization = preg_match('/\b(plot|graph|chart|visualize|show.*graph|draw|diagram|display|illustrate|represent|render|sketch|map|figure|outline|exhibit|demonstrate|view|table)\b/i', $request->message);
-
-        // Add math instructions if needed
-        if ($needsMath) {
-            $mathInstructions = '
-
-        **IMPORTANT: For mathematical expressions, use LaTeX notation:**
-        - Inline math (within text): Wrap in single dollar signs like $x^2 + y^2 = z^2$
-        - Display math (on its own line): Wrap in double dollar signs like $$\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}$$
-
-        Examples:
-        - Fractions: $\frac{a}{b}$
-        - Exponents: $x^2$ or $e^{-x}$
-        - Square roots: $\sqrt{x}$ or $\sqrt[3]{x}$
-        - Integrals: $\int_a^b f(x)dx$
-        - Summations: $\sum_{i=1}^{n} i$
-        - Greek letters: $\alpha$, $\beta$, $\theta$, $\pi$
-
-        Always use this notation for ANY mathematical expression in your response.';
-
-            if ($systemMessage) {
-                $systemMessage .= $mathInstructions;
-            } else {
-                $systemMessage = "You are a helpful AI assistant." . $mathInstructions;
-            }
-        }
-
-        // Add chart instructions if needed
-        if ($needsVisualization) {
-            $chartInstructions = '
-
-        **IMPORTANT: For charts/graphs, use this JSON format:**
-
-        You can create MULTIPLE charts in a single response. Wrap EACH chart in its own chart block (three backticks followed by the word chart).
-
-        Example of creating TWO charts:
-
-        ' . '```chart' . '
-        {
-        "type": "line",
-        "title": "First Chart",
-        "xLabel": "X Axis",
-        "yLabel": "Y Axis",
-        "data": {
-            "labels": [1, 2, 3],
-            "datasets": [{
-            "label": "Dataset 1",
-            "data": [10, 20, 30],
-            "borderColor": "rgb(75, 192, 192)",
-            "backgroundColor": "rgba(75, 192, 192, 0.2)"
-            }]
-        }
-        }
-        ' . '```' . '
-
-        ' . '```chart' . '
-        {
-        "type": "bar",
-        "title": "Second Chart",
-        "xLabel": "Categories",
-        "yLabel": "Values",
-        "data": {
-            "labels": ["A", "B", "C"],
-            "datasets": [{
-            "label": "Dataset 2",
-            "data": [50, 75, 100],
-            "backgroundColor": "rgba(255, 99, 132, 0.2)"
-            }]
-        }
-        }
-        ' . '```' . '
-
-        Supported chart types: line, bar, pie, doughnut, scatter, radar.
-        IMPORTANT: Create as many separate chart blocks as needed - they will ALL render automatically.';
-
-            if ($systemMessage) {
-                $systemMessage .= $chartInstructions;
-            } else {
-                $systemMessage = "You are a helpful AI assistant." . $chartInstructions;
-            }
-        }
-
-        // Auto-adjust model based on token balance
-        $siteSettings = app('siteSettings');
-        if ($user->tokens_left <= 0) {
-            $modelToUse = $siteSettings->default_model;
-            
-            if ($user->selected_model !== $siteSettings->default_model) {
-                $user->selected_model = $siteSettings->default_model;
-                $user->save();
-            }
-        }
-
-        Log::debug('Model Selection', [
-            'openaiModel' => $openaiModel,
-            'modelToUse' => $modelToUse,
-            'provider' => $this->getModelProvider($modelToUse),
-            'isClaude' => $this->isClaudeModel($modelToUse),
-            'isGemini' => $this->isGeminiModel($modelToUse),
-            'isGrok' => $this->isGrokModel($modelToUse),
-            'isOpenAI' => $this->isOpenAIModel($modelToUse)
-        ]);
-
-        // Prepare messages
-        $messages = [];
-        
-        if ($systemMessage) {
-            $messages[] = ['role' => 'system', 'content' => $systemMessage];
-        }
-
-        if ($request->conversation_id) {
-            $dbMessages = ChatMessage::where('conversation_id', $request->conversation_id)
-                ->orderBy('created_at')
-                ->get();
-
-            foreach ($dbMessages as $msg) {
-                $messages[] = [
-                    'role' => $msg->role,
-                    'content' => $msg->content,
-                ];
-            }
-        }
-
-        // Handle file uploads (UNCHANGED - keeping your existing code)
-        $fileContentMessage = null;
-        $uploadedFilePath = null;
-
-        if ($request->hasFile('pdf') && $request->file('pdf')->isValid()) {
-            $file = $request->file('pdf');
-            $extension = strtolower($file->getClientOriginalExtension());
-            $tempPath = $file->storeAs('temp', uniqid() . '.' . $extension);
-            $fullPath = storage_path("app/{$tempPath}");
-
-            if (in_array($extension, ['pdf', 'doc', 'docx'])) {
-                $text = '';
-                try {
-                    if ($extension === 'pdf') {
-                        $parser = new PdfParser();
-                        $pdf = $parser->parseFile($fullPath);
-                        $text = $pdf->getText();
-                    } else {
-                        $phpWord = WordIOFactory::load($fullPath);
-                        $sections = $phpWord->getSections();
-                        foreach ($sections as $section) {
-                            $elements = $section->getElements();
-                            foreach ($elements as $element) {
-                                if (method_exists($element, 'getText')) {
-                                    $text .= $element->getText() . "\n";
-                                } elseif (method_exists($element, 'getElements')) {
-                                    foreach ($element->getElements() as $child) {
-                                        if (method_exists($child, 'getText')) {
-                                            $text .= $child->getText() . "\n";
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    $text = substr($text, 0, 8000);
-
-                    // Upload to Azure
-                    try {
-                        $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
-                        $containerName = config('filesystems.disks.azure.container');
-                        $originalFileName = $file->getClientOriginalName();
-                        $azureFileName = 'chattermate-attachments/' . $originalFileName;
-                        $fileContent = file_get_contents($fullPath);
-                        $blobClient->createBlockBlob($containerName, $azureFileName, $fileContent, new CreateBlockBlobOptions());
-
-                        $uploadedFilePath = [
-                            'file_path' => $azureFileName,
-                            'file_name' => $file->getClientOriginalName(),
-                        ];
-                    } catch (\Exception $azureEx) {
-                        Log::error('Azure upload error: ' . $azureEx->getMessage());
-                    }
-                } catch (\Exception $e) {
-                    Log::error('File parsing error: ' . $e->getMessage());
-                    $text = '[Error parsing uploaded document.]';
-                }
-
-                Storage::delete($tempPath);
-
-                $fileContentMessage = [
-                    'role' => 'system',
-                    'content' => "This is the content of the uploaded document. Refer to it for future questions:\n\n{$text}",
-                ];
-
-            } elseif (in_array($extension, ['png', 'jpg', 'jpeg', 'gif', 'webp'])) {
-                try {
-                    $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
-                    $containerName = config('filesystems.disks.azure.container');
-                    $originalFileName = $file->getClientOriginalName();
-                    $sanitizedFileName = preg_replace('/[^A-Za-z0-9\-_\.]/', '-', $originalFileName);
-                    $sanitizedFileName = preg_replace('/-+/', '-', $sanitizedFileName);
-                    
-                    $imageName = 'chattermate-attachments/' . $sanitizedFileName;
-                    $imageContent = file_get_contents($file->getRealPath());
-                    $blobClient->createBlockBlob($containerName, $imageName, $imageContent, new CreateBlockBlobOptions());
-
-                    $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
-                    $publicUrl = "{$baseUrl}/{$containerName}/{$imageName}";
-
-                    $fileContentMessage = [
-                        'role' => 'user',
-                        'content' => [
-                            ['type' => 'text', 'text' => $request->message ?: "What is in this image?"],
-                            ['type' => 'image_url', 'image_url' => ['url' => $publicUrl]],
-                        ],
-                    ];
-
-                    $uploadedFilePath = [
-                        'file_path' => $imageName,
-                        'file_name' => $originalFileName,
-                    ];
-
-                    Storage::delete($tempPath);
-                } catch (\Exception $e) {
-                    Log::error('Image upload error: ' . $e->getMessage());
-                    Storage::delete($tempPath);
-                }
-            } else {
-                Storage::delete($tempPath);
-            }
-        }
-
-        $useVision = isset($fileContentMessage['content'][1]['type']) && 
-                    $fileContentMessage['content'][1]['type'] === 'image_url';
-
-        if ($fileContentMessage) {
-            $messages[] = $fileContentMessage;
-            if ($fileContentMessage['role'] === 'system' && $request->message) {
-                $messages[] = ['role' => 'user', 'content' => $request->message];
-            }
-        }
-
-        if (!$fileContentMessage) {
-            $messages[] = ['role' => 'user', 'content' => $request->message];
-        }
-
-        // Force vision model for images
-        if ($useVision && $this->isOpenAIModel($modelToUse)) {
-            $modelToUse = 'gpt-4.1-mini';
-        }
-
-        // Route to appropriate API
-        if ($this->isClaudeModel($modelToUse)) {
-            return $this->streamClaudeResponse($request, $messages, $modelToUse, $fileContentMessage, $uploadedFilePath, $expert);
-        } elseif ($this->isGeminiModel($modelToUse)) {
-            return $this->streamGeminiResponse($request, $messages, $modelToUse, $fileContentMessage, $uploadedFilePath, $expert);
-        } elseif ($this->isGrokModel($modelToUse)) {
-            return $this->streamGrokResponse($request, $messages, $modelToUse, $fileContentMessage, $uploadedFilePath, $expert);
-        } else {
-            return $this->streamOpenAIResponse($request, $messages, $modelToUse, $fileContentMessage, $uploadedFilePath, $expert);
-        }
-    }
-
     // ✅ NEW: Helper method to get suggested model based on complexity
     private function getSuggestedModelFromComplexity(int $score, string $currentModel, $user, bool $requireWebSearch = false): string
     {
@@ -1018,198 +543,6 @@ class CompareController extends Controller
         ]);
         return $fallbackModel;
     }
-
-    // ✅ UPDATED: Smart model selection with cross-provider support
-    private function applySmartModelSelection(
-        string $userSelectedModel, 
-        string $suggestedModel, 
-        int $complexityScore,
-        $user,
-        bool $allowCrossProvider = false  // ✅ NEW parameter
-    ): string {
-        // ⛔ CRITICAL: Check if user has access to their selected model
-        if (!$user->hasModelAccess($userSelectedModel)) {
-            Log::warning('User selected model they don\'t have access to', [
-                'user_id' => $user->id,
-                'plan' => $user->plan?->name,
-                'selected_model' => $userSelectedModel,
-                'available_models' => $user->aiModels()
-            ]);
-            
-            // Return suggested model (which is already validated for user access)
-            return $suggestedModel;
-        }
-        
-        // Get model tier information from ai_settings
-        $selectedModelTier = $this->getModelTier($userSelectedModel);
-        $suggestedModelTier = $this->getModelTier($suggestedModel);
-        $selectedProvider = $this->getModelProvider($userSelectedModel);
-        $suggestedProvider = $this->getModelProvider($suggestedModel);
-        
-        Log::debug('Model selection comparison', [
-            'selected' => [
-                'model' => $userSelectedModel,
-                'tier' => $selectedModelTier,
-                'provider' => $selectedProvider,
-                'tier_level' => $this->getTierLevel($selectedModelTier)
-            ],
-            'suggested' => [
-                'model' => $suggestedModel,
-                'tier' => $suggestedModelTier,
-                'provider' => $suggestedProvider,
-                'tier_level' => $this->getTierLevel($suggestedModelTier)
-            ],
-            'complexity' => $complexityScore,
-            'allow_cross_provider' => $allowCrossProvider
-        ]);
-        
-        // ✅ Strategy 1: Prevent over-selection (user picks premium for simple task)
-        // This saves costs and improves efficiency
-        if ($complexityScore < 25 && $selectedModelTier === 'premium') {
-            Log::info('Downgrading from premium model for very simple query', [
-                'from' => $userSelectedModel,
-                'from_tier' => $selectedModelTier,
-                'from_provider' => $selectedProvider,
-                'to' => $suggestedModel,
-                'to_tier' => $suggestedModelTier,
-                'to_provider' => $suggestedProvider,
-                'complexity' => $complexityScore,
-                'cross_provider' => $allowCrossProvider,
-                'reason' => 'Over-qualification - simple query doesn\'t need premium model'
-            ]);
-            return $suggestedModel;
-        }
-        
-        // ✅ Strategy 2: Auto-optimize for free/basic tier users or when enabled
-        // This helps manage costs for users with limited plans
-        if ($this->shouldAutoOptimize($user)) {
-            // Only downgrade, never upgrade (respect plan limits)
-            $tierHierarchy = ['basic' => 0, 'standard' => 1, 'advanced' => 2, 'premium' => 3];
-            $selectedTierLevel = $tierHierarchy[$selectedModelTier] ?? 0;
-            $suggestedTierLevel = $tierHierarchy[$suggestedModelTier] ?? 0;
-            
-            if ($suggestedTierLevel < $selectedTierLevel) {
-                Log::info('Auto-optimizing model for cost savings', [
-                    'from' => $userSelectedModel,
-                    'from_provider' => $selectedProvider,
-                    'to' => $suggestedModel,
-                    'to_provider' => $suggestedProvider,
-                    'complexity' => $complexityScore,
-                    'plan' => $user->plan?->name ?? 'none',
-                    'cross_provider' => $allowCrossProvider,
-                    'reason' => 'Auto-optimization enabled'
-                ]);
-                return $suggestedModel;
-            }
-        }
-        
-        // ✅ Strategy 3: Warn if complexity suggests higher tier but user doesn't have access
-        // This helps identify when users might need to upgrade their plan
-        $selectedTierLevel = $this->getTierLevel($selectedModelTier);
-        $suggestedTierLevel = $this->getTierLevel($suggestedModelTier);
-        
-        if ($complexityScore >= 70 && $suggestedTierLevel > $selectedTierLevel) {
-            Log::warning('Complex query but user lacks access to optimal tier', [
-                'selected_model' => $userSelectedModel,
-                'selected_tier' => $selectedModelTier,
-                'selected_provider' => $selectedProvider,
-                'suggested_model' => $suggestedModel,
-                'suggested_tier' => $suggestedModelTier,
-                'suggested_provider' => $suggestedProvider,
-                'complexity' => $complexityScore,
-                'plan' => $user->plan?->name,
-                'available_models' => $user->aiModels(),
-                'cross_provider' => $allowCrossProvider,
-                'recommendation' => 'Consider upgrading plan for better results'
-            ]);
-        }
-        
-        // ✅ Strategy 4: Apply auto-selection (method only called when enabled)
-        if ($suggestedModel && $user->hasModelAccess($suggestedModel)) {
-            Log::info('Auto-optimized model selection applied', [
-                'user_id' => $user->id,
-                'from' => $userSelectedModel,
-                'from_tier' => $selectedModelTier,
-                'from_provider' => $selectedProvider,
-                'to' => $suggestedModel,
-                'to_tier' => $suggestedModelTier,
-                'to_provider' => $suggestedProvider,
-                'complexity_score' => $complexityScore,
-                'plan' => $user->plan?->name ?? 'none',
-                'cross_provider_enabled' => $allowCrossProvider,
-                'provider_switched' => $selectedProvider !== $suggestedProvider,
-                'reason' => 'Auto-optimization enabled via checkbox'
-            ]);
-            return $suggestedModel;
-        }
-
-        // ✅ Default: Respect user's selected model
-        Log::info('Using user-selected model', [
-            'user_id' => $user->id,
-            'model' => $userSelectedModel,
-            'tier' => $selectedModelTier,
-            'provider' => $selectedProvider,
-            'reason' => 'Fallback - using user selection'
-        ]);
-        return $userSelectedModel;
-    }
-
-    private function getModelTier(string $modelName): string
-    {
-        $aiSetting = DB::table('a_i_settings')
-            ->where('openaimodel', $modelName)
-            ->where('status', 1)
-            ->first();
-        
-        return $aiSetting?->tier ?? 'basic';
-    }
-   
-    private function getTierLevel(string $tier): int
-    {
-        $tierLevels = [
-            'basic' => 0,
-            'standard' => 1,
-            'advanced' => 2,
-            'premium' => 3
-        ];
-        
-        return $tierLevels[$tier] ?? 0;
-    }
-
-    private function shouldAutoOptimize($user): bool
-    {
-        // Auto-optimize for:
-        // 1. Users without active subscription
-        if (!$user->hasActiveSubscription()) {
-            Log::debug('Auto-optimize: No active subscription');
-            return true;
-        }
-        
-        // 2. Free or basic tier users
-        $planName = strtolower($user->plan?->name ?? 'free');
-        if (str_contains($planName, 'free') || str_contains($planName, 'basic')) {
-            Log::debug('Auto-optimize: Free or basic plan', ['plan' => $planName]);
-            return true;
-        }
-        
-        // 3. Users who explicitly enabled auto-optimize
-        $autoOptimizeEnabled = $user->auto_optimize_model ?? false;
-        if ($autoOptimizeEnabled) {
-            Log::debug('Auto-optimize: User preference enabled');
-            return true;
-        }
-        
-        // 4. Users with low token balance (if applicable)
-        if (isset($user->tokens_left)) {
-            $lowTokens = $user->tokens_left < 1000;
-            if ($lowTokens) {
-                Log::debug('Auto-optimize: Low token balance', ['tokens' => $user->tokens_left]);
-                return true;
-            }
-        }
-        
-        return false;
-    }
    
     // ✅ NEW: Helper method to find cheapest model from a list of model names
     private function getCheapestModelFromList(array $modelNames, ?string $provider = null): string
@@ -1247,650 +580,6 @@ class CompareController extends Controller
         ]);
         
         return $cheapest->openaimodel;
-    }
-    /**
-     * Get cheaper alternative model within user's accessible models
-     * Used for downgrading when needed
-     */
-    private function getCheaperAlternative(string $model, $user): string
-    {
-        $currentTier = $this->getModelTier($model);
-        $currentTierLevel = $this->getTierLevel($currentTier);
-        $currentProvider = $this->getModelProvider($model);
-        
-        // Get user's accessible models from same provider only
-        $userModels = $this->getUserModelsByProvider($user, $currentProvider);
-        
-        // Get AI settings for user's accessible models (same provider)
-        $accessibleModels = DB::table('a_i_settings')
-            ->whereIn('openaimodel', $userModels)
-            ->where('status', 1)
-            ->orderBy('tier')
-            ->orderBy('cost_per_m_tokens', 'asc') // ✅ Order by cost
-            ->get();
-        
-        // Filter by provider
-        $accessibleModels = $accessibleModels->filter(function($setting) use ($currentProvider) {
-            return $this->getModelProvider($setting->openaimodel) === $currentProvider;
-        });
-        
-        // ✅ Find the CHEAPEST model with lower tier level than current
-        $cheapestAlternative = null;
-        $lowestCost = PHP_FLOAT_MAX;
-        
-        foreach ($accessibleModels as $aiSetting) {
-            $modelTierLevel = $this->getTierLevel($aiSetting->tier);
-            $cost = (float) ($aiSetting->cost_per_m_tokens ?? PHP_FLOAT_MAX);
-            
-            if ($modelTierLevel < $currentTierLevel && $cost < $lowestCost) {
-                $cheapestAlternative = $aiSetting;
-                $lowestCost = $cost;
-            }
-        }
-        
-        if ($cheapestAlternative) {
-            Log::info('Found cheapest alternative (same provider)', [
-                'from' => $model,
-                'from_tier' => $currentTier,
-                'to' => $cheapestAlternative->openaimodel,
-                'to_tier' => $cheapestAlternative->tier,
-                'cost_per_m_tokens' => $lowestCost,
-                'provider' => $currentProvider
-            ]);
-            return $cheapestAlternative->openaimodel;
-        }
-        
-        // Fallback to cheapest accessible model from provider or current model
-        $fallback = $this->getCheapestModelFromList($userModels, $currentProvider) ?: $model;
-        Log::debug('No cheaper alternative found (same provider), using cheapest fallback', [
-            'model' => $fallback,
-            'provider' => $currentProvider
-        ]);
-        return $fallback;
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-    // Update the streamGrokResponse method
-    private function streamGrokResponse($request, $messages, $modelToUse, $fileContentMessage, $uploadedFilePath, $expert)
-    {
-        Log::debug('Streaming Grok response', ['model' => $modelToUse]);
-        
-        $apiKey = config('services.xai.api_key');
-        $useWebSearch = $request->boolean('web_search');
-        
-        // Convert messages to OpenAI format (Grok is OpenAI-compatible)
-        $payload = [
-            'model' => $modelToUse,
-            'messages' => $messages,
-            'stream' => true,
-            'temperature' => 0.7,
-            'max_tokens' => 4096,
-        ];
-        
-        // ✅ CORRECTED: Use the actual Grok API search parameters format
-        if ($useWebSearch) {
-                // Don't add search_parameters at all - let Grok decide based on content
-                
-                // Just enhance the message to indicate need for current data
-                $currentDate = date('Y-m-d');
-                $lastMessage = end($messages);
-                if ($lastMessage && $lastMessage['role'] === 'user') {
-                    $originalContent = $lastMessage['content'];
-                    
-                    // Make it clear we need current information
-                    $messages[count($messages) - 1]['content'] = 
-                        "Current date: {$currentDate}. " . 
-                        "Please search for and use only the most recent, up-to-date information when answering: " . 
-                        $originalContent;
-                }
-                $payload['messages'] = $messages;
-            }
-        
-        Log::debug('Grok API Payload', ['payload' => $payload, 'use_search' => $useWebSearch]);
-        
-        return response()->stream(function () use ($payload, $apiKey, $request, $fileContentMessage, $uploadedFilePath, $messages, $expert, $modelToUse, $useWebSearch) {
-            header('Content-Type: text/event-stream');
-            header('Cache-Control: no-cache');
-            header('Connection: keep-alive');
-            header('X-Accel-Buffering: no');
-
-            $fullContent = '';
-            $chunkCount = 0;
-            $buffer = '';
-            $searchUsed = false;
-            $sourcesUsed = 0;
-            $searchQueries = [];
-            $citations = [];
-
-            try {
-                $ch = curl_init('https://api.x.ai/v1/chat/completions');
-                
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => false,
-                    CURLOPT_POST => true,
-                    CURLOPT_HTTPHEADER => [
-                        'Content-Type: application/json',
-                        'Authorization: Bearer ' . $apiKey,
-                    ],
-                    CURLOPT_POSTFIELDS => json_encode($payload),
-                    CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$fullContent, &$chunkCount, &$buffer, &$searchUsed, &$sourcesUsed, &$searchQueries, &$citations, $useWebSearch) {
-                        $buffer .= $data;
-                        $lines = explode("\n", $buffer);
-                        
-                        // Keep the last incomplete line in the buffer
-                        $buffer = array_pop($lines);
-                        
-                        foreach ($lines as $line) {
-                            $line = trim($line);
-                            
-                            if (empty($line)) {
-                                continue;
-                            }
-                            
-                            if (strpos($line, 'data: ') === 0) {
-                                $line = substr($line, 6);
-                            }
-                            
-                            if ($line === '[DONE]') {
-                                continue;
-                            }
-                            
-                            try {
-                                $decoded = json_decode($line, true);
-                                
-                                if (json_last_error() !== JSON_ERROR_NONE) {
-                                    Log::warning('Grok JSON parse error: ' . json_last_error_msg() . ' | Line: ' . $line);
-                                    continue;
-                                }
-                                
-                                // ✅ IMPROVED: Better search detection and notification
-                                // Send search start notification if we detect search activity
-                                if ($useWebSearch && !$searchUsed && isset($decoded['choices'][0]['delta']['tool_calls'])) {
-                                    $searchUsed = true;
-                                    Log::info('Grok Live Search initiated - tool calls detected');
-                                    
-                                    // Send search notification to frontend
-                                    echo "data: " . json_encode([
-                                        'search_info' => [
-                                            'message' => 'Searching current data...',
-                                            'status' => 'searching'
-                                        ]
-                                    ]) . "\n\n";
-                                    ob_flush();
-                                    flush();
-                                }
-                                
-                                // Handle regular content streaming
-                                if (isset($decoded['choices'][0]['delta']['content'])) {
-                                    $content = $decoded['choices'][0]['delta']['content'];
-                                    $fullContent .= $content;
-                                    $chunkCount++;
-                                    
-                                    // ✅ IMPROVED: More comprehensive search detection
-                                    if ($useWebSearch && !$searchUsed) {
-                                        $searchIndicators = [
-                                            'searching',
-                                            'according to',
-                                            'based on current',
-                                            'latest information',
-                                            'recent data',
-                                            'real-time',
-                                            'up-to-date',
-                                            'current information',
-                                            'live data',
-                                            'today\'s',
-                                            date('Y') // Current year
-                                        ];
-                                        
-                                        foreach ($searchIndicators as $indicator) {
-                                            if (stripos($content, $indicator) !== false) {
-                                                $searchUsed = true;
-                                                Log::info("Grok Live Search detected via content indicator: {$indicator}");
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    
-                                    echo "data: " . json_encode(['content' => $content]) . "\n\n";
-                                    ob_flush();
-                                    flush();
-                                }
-                                
-                                // ✅ IMPROVED: Handle search metadata and usage
-                                if (isset($decoded['usage'])) {
-                                    // Check for live search queries
-                                    if (isset($decoded['usage']['live_search_queries']) && $decoded['usage']['live_search_queries'] > 0) {
-                                        $searchUsed = true;
-                                        $sourcesUsed = $decoded['usage']['live_search_queries'];
-                                        Log::info('Grok used ' . $sourcesUsed . ' live search queries');
-                                    }
-                                    
-                                    // Check for search sources
-                                    if (isset($decoded['usage']['search_sources_used']) && $decoded['usage']['search_sources_used'] > 0) {
-                                        $searchUsed = true;
-                                        $sourcesUsed = max($sourcesUsed, $decoded['usage']['search_sources_used']);
-                                        Log::info('Grok used ' . $sourcesUsed . ' search sources');
-                                    }
-                                }
-                                
-                                // ✅ NEW: Handle search results and citations
-                                if (isset($decoded['search_results']) && is_array($decoded['search_results'])) {
-                                    $searchUsed = true;
-                                    foreach ($decoded['search_results'] as $result) {
-                                        if (isset($result['url'])) {
-                                            $citations[] = $result['url'];
-                                        }
-                                    }
-                                    Log::info('Grok search results received', ['count' => count($decoded['search_results'])]);
-                                }
-                                
-                                // ✅ NEW: Handle citations
-                                if (isset($decoded['citations']) && is_array($decoded['citations'])) {
-                                    $citations = array_merge($citations, $decoded['citations']);
-                                    Log::info('Grok citations received', ['count' => count($decoded['citations'])]);
-                                }
-                                
-                                // ✅ NEW: Handle search queries
-                                if (isset($decoded['search_queries']) && is_array($decoded['search_queries'])) {
-                                    $searchQueries = array_merge($searchQueries, $decoded['search_queries']);
-                                    $searchUsed = true;
-                                    Log::info('Grok search queries', ['queries' => $decoded['search_queries']]);
-                                }
-                                
-                                // Check for finish reason
-                                if (isset($decoded['choices'][0]['finish_reason'])) {
-                                    $finishReason = $decoded['choices'][0]['finish_reason'];
-                                    if ($finishReason !== 'stop') {
-                                        Log::warning('Grok unusual finish reason: ' . $finishReason);
-                                    }
-                                }
-                                
-                            } catch (\Exception $e) {
-                                Log::error('Grok stream parse error: ' . $e->getMessage() . ' | Line: ' . $line);
-                            }
-                        }
-                        
-                        return strlen($data);
-                    }
-                ]);
-
-                $result = curl_exec($ch);
-                
-                if (curl_errno($ch)) {
-                    $error = curl_error($ch);
-                    Log::error('Grok API curl error: ' . $error);
-                    echo "data: " . json_encode(['content' => '', 'error' => 'API connection error: ' . $error]) . "\n\n";
-                    ob_flush();
-                    flush();
-                }
-                
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                if ($httpCode !== 200) {
-                    Log::error('Grok API HTTP error: ' . $httpCode);
-                    echo "data: " . json_encode(['content' => '', 'error' => 'API returned error code: ' . $httpCode]) . "\n\n";
-                    ob_flush();
-                    flush();
-                }
-                
-                curl_close($ch);
-
-            } catch (\Exception $e) {
-                Log::error('Grok streaming error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
-                echo "data: " . json_encode(['content' => '', 'error' => $e->getMessage()]) . "\n\n";
-                ob_flush();
-                flush();
-            }
-
-            // ✅ IMPROVED: Add citations to response if available
-            if (!empty($citations) && $useWebSearch && $searchUsed) {
-                $citationText = "\n\n**Sources:**\n";
-                $uniqueCitations = array_unique($citations);
-                foreach ($uniqueCitations as $index => $citation) {
-                    $citationText .= ($index + 1) . ". [{$citation}]({$citation})\n";
-                }
-                $fullContent .= $citationText;
-                
-                // Send citations as final content
-                echo "data: " . json_encode(['content' => $citationText]) . "\n\n";
-                ob_flush();
-                flush();
-            }
-
-            // Save to database
-            if (Auth::check() && $request->conversation_id) {
-                $this->saveConversation($request, $fullContent, $uploadedFilePath, $fileContentMessage, $expert);
-            }
-
-            Log::info('Grok stream completed', [
-                'total_chunks' => $chunkCount,
-                'content_length' => strlen($fullContent),
-                'search_used' => $searchUsed,
-                'sources_used' => $sourcesUsed,
-                'citations_found' => count($citations),
-                'search_queries' => $searchQueries
-            ]);
-            
-            echo "data: [DONE]\n\n";
-            ob_flush();
-            flush();
-
-            // ✅ IMPROVED: Better cost calculation for search
-            try {
-                $totalTokenCount = 0;
-                foreach ($messages as $msg) {
-                    $encodedMessage = json_encode($msg);
-                    $totalTokenCount += approximateTokenCount($encodedMessage);
-                }
-                $totalTokenCount += approximateTokenCount($fullContent);
-
-                // Calculate search cost based on actual usage
-                $searchCost = 0;
-                if ($useWebSearch && $searchUsed && $sourcesUsed > 0) {
-                    // Grok charges approximately $25 per 1,000 sources
-                    $searchCost = max(1, ceil($sourcesUsed * 0.025)); // Minimum 1 credit
-                    Log::info("Grok search cost: {$sourcesUsed} sources = {$searchCost} credits");
-                }
-
-                if (Auth::check()) {
-                    deductUserTokensAndCredits($totalTokenCount, $searchCost, $modelToUse);
-                    Log::info("Deducted {$totalTokenCount} tokens and {$searchCost} search credits for Grok");
-                }
-            } catch (\Exception $e) {
-                Log::error('Error deducting tokens: ' . $e->getMessage());
-            }
-
-        }, 200, [
-            'Content-Type' => 'text/event-stream',
-            'Cache-Control' => 'no-cache',
-            'Connection' => 'keep-alive',
-            'X-Accel-Buffering' => 'no',
-        ]);
-    }
-
-    // Add this method to stream Gemini responses
-    // In your ChatController.php, update the streamGeminiResponse method
-
-    private function streamGeminiResponse($request, $messages, $modelToUse, $fileContentMessage, $uploadedFilePath, $expert)
-    {
-        Log::debug('Streaming Gemini response', ['model' => $modelToUse]);
-        
-        // Convert messages to Gemini format
-        $geminiMessages = $this->convertMessagesToGeminiFormat($messages);
-        
-        $apiKey = config('services.gemini.api_key');
-        $useWebSearch = $request->boolean('web_search');
-        
-        // Gemini API endpoint for streaming
-        $endpoint = "https://generativelanguage.googleapis.com/v1beta/models/{$modelToUse}:streamGenerateContent?alt=sse&key={$apiKey}";
-        
-        $payload = [
-            'contents' => $geminiMessages['contents'],
-            'generationConfig' => [
-                'temperature' => 1.0, // Google recommends 1.0 for grounding
-                'topK' => 40,
-                'topP' => 0.95,
-                'maxOutputTokens' => 8192,
-            ],
-        ];
-        
-        // Add system instruction if present
-        if ($geminiMessages['systemInstruction']) {
-            $payload['systemInstruction'] = [
-                'parts' => [
-                    ['text' => $geminiMessages['systemInstruction']]
-                ]
-            ];
-        }
-        
-        // ✅ UPDATED: Use new google_search tool format for newer models
-        if ($useWebSearch) {
-            // For Gemini 2.0+ models, use the new format
-            if (str_contains($modelToUse, '2.') || str_contains($modelToUse, 'flash-002')) {
-                $payload['tools'] = [
-                    [
-                        'google_search' => (object)[] // Empty object for default settings
-                    ]
-                ];
-            } else {
-                // For older Gemini 1.5 models, use legacy format
-                $payload['tools'] = [
-                    [
-                        'googleSearchRetrieval' => [
-                            'dynamicRetrievalConfig' => [
-                                'mode' => 'MODE_DYNAMIC',
-                                'dynamicThreshold' => 0.7
-                            ]
-                        ]
-                    ]
-                ];
-            }
-            
-            Log::debug('Gemini web search enabled', [
-                'model' => $modelToUse,
-                'tool_format' => str_contains($modelToUse, '2.') ? 'google_search' : 'googleSearchRetrieval'
-            ]);
-        }
-        
-        Log::debug('Gemini API Payload', ['payload' => $payload]);
-        
-        return response()->stream(function () use ($payload, $endpoint, $request, $fileContentMessage, $uploadedFilePath, $messages, $expert, $modelToUse, $useWebSearch) {
-            header('Content-Type: text/event-stream');
-            header('Cache-Control: no-cache');
-            header('Connection: keep-alive');
-            header('X-Accel-Buffering: no');
-
-            $fullContent = '';
-            $chunkCount = 0;
-            $buffer = '';
-            $groundingMetadata = null;
-
-            try {
-                $ch = curl_init($endpoint);
-                
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => false,
-                    CURLOPT_POST => true,
-                    CURLOPT_HTTPHEADER => [
-                        'Content-Type: application/json',
-                    ],
-                    CURLOPT_POSTFIELDS => json_encode($payload),
-                    CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$fullContent, &$chunkCount, &$buffer, &$groundingMetadata, $useWebSearch) {
-                        $buffer .= $data;
-                        $lines = explode("\n", $buffer);
-                        
-                        // Keep the last incomplete line in the buffer
-                        $buffer = array_pop($lines);
-                        
-                        foreach ($lines as $line) {
-                            $line = trim($line);
-                            
-                            // Skip empty lines
-                            if (empty($line)) {
-                                continue;
-                            }
-                            
-                            // Remove "data: " prefix if present (SSE format)
-                            if (strpos($line, 'data: ') === 0) {
-                                $line = substr($line, 6);
-                            }
-                            
-                            // Skip [DONE] marker
-                            if ($line === '[DONE]') {
-                                continue;
-                            }
-                            
-                            try {
-                                $decoded = json_decode($line, true);
-                                
-                                if (json_last_error() !== JSON_ERROR_NONE) {
-                                    Log::warning('Gemini JSON parse error: ' . json_last_error_msg() . ' | Line: ' . $line);
-                                    continue;
-                                }
-                                
-                                // Extract text from Gemini response
-                                if (isset($decoded['candidates'][0]['content']['parts'])) {
-                                    foreach ($decoded['candidates'][0]['content']['parts'] as $part) {
-                                        if (isset($part['text'])) {
-                                            $content = $part['text'];
-                                            $fullContent .= $content;
-                                            $chunkCount++;
-                                            
-                                            echo "data: " . json_encode(['content' => $content]) . "\n\n";
-                                            ob_flush();
-                                            flush();
-                                        }
-                                    }
-                                }
-                                
-                                // ✅ NEW: Handle grounding metadata (web search results)
-                                if (isset($decoded['candidates'][0]['groundingMetadata']) && $useWebSearch) {
-                                    $groundingMetadata = $decoded['candidates'][0]['groundingMetadata'];
-                                    
-                                    // Log search queries for debugging
-                                    if (isset($groundingMetadata['webSearchQueries'])) {
-                                        Log::info('Gemini used web search', [
-                                            'queries' => $groundingMetadata['webSearchQueries']
-                                        ]);
-                                        
-                                        // Optional: Show search indicator to user
-                                        echo "data: " . json_encode([
-                                            'content' => '', 
-                                            'search_info' => [
-                                                'queries' => $groundingMetadata['webSearchQueries'],
-                                                'message' => '🔍 Searched: ' . implode(', ', $groundingMetadata['webSearchQueries'])
-                                            ]
-                                        ]) . "\n\n";
-                                        ob_flush();
-                                        flush();
-                                    }
-                                    
-                                    // Store grounding chunks for citations
-                                    if (isset($groundingMetadata['groundingChunks'])) {
-                                        Log::debug('Gemini grounding sources', [
-                                            'sources' => array_map(function($chunk) {
-                                                return $chunk['web']['uri'] ?? 'Unknown';
-                                            }, $groundingMetadata['groundingChunks'])
-                                        ]);
-                                    }
-                                }
-                                
-                                // Check for finish reason
-                                if (isset($decoded['candidates'][0]['finishReason'])) {
-                                    $finishReason = $decoded['candidates'][0]['finishReason'];
-                                    if ($finishReason !== 'STOP') {
-                                        Log::warning('Gemini unusual finish reason: ' . $finishReason);
-                                    }
-                                }
-                                
-                            } catch (\Exception $e) {
-                                Log::error('Gemini stream parse error: ' . $e->getMessage() . ' | Line: ' . $line);
-                            }
-                        }
-                        
-                        return strlen($data);
-                    }
-                ]);
-
-                $result = curl_exec($ch);
-                
-                if (curl_errno($ch)) {
-                    $error = curl_error($ch);
-                    Log::error('Gemini API curl error: ' . $error);
-                    echo "data: " . json_encode(['content' => '', 'error' => 'API connection error: ' . $error]) . "\n\n";
-                    ob_flush();
-                    flush();
-                }
-                
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                if ($httpCode !== 200) {
-                    Log::error('Gemini API HTTP error: ' . $httpCode);
-                    echo "data: " . json_encode(['content' => '', 'error' => 'API returned error code: ' . $httpCode]) . "\n\n";
-                    ob_flush();
-                    flush();
-                }
-                
-                curl_close($ch);
-
-            } catch (\Exception $e) {
-                Log::error('Gemini streaming error: ' . $e->getMessage() . "\n" . $e->getTraceAsString());
-                echo "data: " . json_encode(['content' => '', 'error' => $e->getMessage()]) . "\n\n";
-                ob_flush();
-                flush();
-            }
-
-            // ✅ NEW: Add citations to content if grounding was used
-            if ($groundingMetadata && isset($groundingMetadata['groundingChunks']) && $useWebSearch) {
-                $citations = "\n\n**Sources:**\n";
-                foreach ($groundingMetadata['groundingChunks'] as $index => $chunk) {
-                    if (isset($chunk['web'])) {
-                        $title = $chunk['web']['title'] ?? 'Source';
-                        $uri = $chunk['web']['uri'] ?? '#';
-                        $citations .= "- [{$title}]({$uri})\n";
-                    }
-                }
-                $fullContent .= $citations;
-                
-                // Send citations as final content
-                echo "data: " . json_encode(['content' => $citations]) . "\n\n";
-                ob_flush();
-                flush();
-            }
-
-            // Save to database
-            if (Auth::check() && $request->conversation_id) {
-                $this->saveConversation($request, $fullContent, $uploadedFilePath, $fileContentMessage, $expert);
-            }
-
-            Log::info('Gemini stream completed', [
-                'total_chunks' => $chunkCount,
-                'content_length' => strlen($fullContent),
-                'used_search' => !is_null($groundingMetadata)
-            ]);
-            
-            echo "data: [DONE]\n\n";
-            ob_flush();
-            flush();
-
-            // Deduct tokens - Add extra cost for search if used
-            try {
-                $totalTokenCount = 0;
-                foreach ($messages as $msg) {
-                    $encodedMessage = json_encode($msg);
-                    $totalTokenCount += approximateTokenCount($encodedMessage);
-                }
-                $totalTokenCount += approximateTokenCount($fullContent);
-
-                // Add additional tokens/credits for search usage (since Google charges $35/1000 queries)
-                $searchCost = 0;
-                if ($useWebSearch && $groundingMetadata) {
-                    $searchCost = 50; // Adjust based on your pricing model
-                }
-
-                if (Auth::check()) {
-                    deductUserTokensAndCredits($totalTokenCount, $searchCost, $modelToUse);
-                    Log::info("Deducted {$totalTokenCount} tokens and {$searchCost} search credits for Gemini");
-                }
-            } catch (\Exception $e) {
-                Log::error('Error deducting tokens: ' . $e->getMessage());
-            }
-
-        }, 200, [
-            'Content-Type' => 'text/event-stream',
-            'Cache-Control' => 'no-cache',
-            'Connection' => 'keep-alive',
-            'X-Accel-Buffering' => 'no',
-        ]);
     }
 
     // Convert messages format for Gemini API
@@ -1994,794 +683,6 @@ class CompareController extends Controller
         ];
     }
 
-    private function streamOpenAIResponse($request, $messages, $modelToUse, $fileContentMessage, $uploadedFilePath, $expert)
-    {
-        Log::debug('Streaming OpenAI response', ['model' => $modelToUse]);
-        
-        $response = OpenAI::chat()->createStreamed([
-            'model' => $modelToUse,
-            'messages' => $messages,
-            'stream' => true,
-        ]);
-
-        return $this->createStreamedResponse($response, $request, $fileContentMessage, $uploadedFilePath, $messages, $expert, $modelToUse, 'openai');
-    }
-
-    private function streamClaudeResponse($request, $messages, $modelToUse, $fileContentMessage, $uploadedFilePath, $expert)
-    {
-        Log::debug('Streaming Claude response', ['model' => $modelToUse]);
-        
-        $claudeData = $this->convertMessagesToClaudeFormat($messages);
-        
-        $payload = [
-            'model' => $modelToUse,
-            'messages' => $claudeData['messages'],
-            'max_tokens' => 4096,
-            'stream' => true,
-        ];
-
-        if ($claudeData['system']) {
-            $payload['system'] = $claudeData['system'];
-        }
-
-        // ✅ ADD WEB SEARCH TOOL IF ENABLED
-        $useWebSearch = $request->boolean('web_search');
-        if ($useWebSearch) {
-            $payload['tools'] = [
-                [
-                    'type' => 'web_search_20250305',
-                    'name' => 'web_search',
-                    'max_uses' => 5  // Claude can search up to 5 times
-                ]
-            ];
-        }
-
-        Log::debug('Claude API Payload', ['payload' => $payload]);
-
-        $apiKey = config('services.anthropic.api_key');
-        
-        return response()->stream(function () use ($payload, $apiKey, $request, $fileContentMessage, $uploadedFilePath, $messages, $expert, $modelToUse) {
-            header('Content-Type: text/event-stream');
-            header('Cache-Control: no-cache');
-            header('Connection: keep-alive');
-            header('X-Accel-Buffering: no');
-
-            $fullContent = '';
-            $chunkCount = 0;
-
-            try {
-                $ch = curl_init('https://api.anthropic.com/v1/messages');
-                
-                curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => false,
-                    CURLOPT_POST => true,
-                    CURLOPT_HTTPHEADER => [
-                        'Content-Type: application/json',
-                        'x-api-key: ' . $apiKey,
-                        'anthropic-version: 2023-06-01',
-                    ],
-                    CURLOPT_POSTFIELDS => json_encode($payload),
-                    CURLOPT_WRITEFUNCTION => function ($ch, $data) use (&$fullContent, &$chunkCount) {
-                        $lines = explode("\n", $data);
-                        
-                        foreach ($lines as $line) {
-                            if (strpos($line, 'data: ') === 0) {
-                                $json = substr($line, 6);
-                                
-                                if (trim($json) === '[DONE]') {
-                                    continue;
-                                }
-                                
-                                try {
-                                    $decoded = json_decode($json, true);
-                                    
-                                    if (isset($decoded['type'])) {
-                                        // Handle text content streaming
-                                        if ($decoded['type'] === 'content_block_delta') {
-                                            $content = $decoded['delta']['text'] ?? '';
-                                            $fullContent .= $content;
-                                            $chunkCount++;
-                                            
-                                            echo "data: " . json_encode(['content' => $content]) . "\n\n";
-                                            ob_flush();
-                                            flush();
-                                        }
-                                        
-                                        // ✅ Show when Claude is searching (optional)
-                                        if ($decoded['type'] === 'content_block_start' && 
-                                            isset($decoded['content_block']['type']) && 
-                                            $decoded['content_block']['type'] === 'tool_use') {
-                                            
-                                            Log::info('Claude is using web search');
-                                            
-                                            // Optionally show a search indicator to user
-                                            echo "data: " . json_encode(['content' => ' 🔍 ']) . "\n\n";
-                                            ob_flush();
-                                            flush();
-                                        }
-                                    }
-                                } catch (\Exception $e) {
-                                    Log::error('Claude stream parse error: ' . $e->getMessage());
-                                }
-                            }
-                        }
-                        
-                        return strlen($data);
-                    }
-                ]);
-
-                curl_exec($ch);
-                
-                if (curl_errno($ch)) {
-                    Log::error('Claude API error: ' . curl_error($ch));
-                    echo "data: " . json_encode(['content' => '', 'error' => 'API error']) . "\n\n";
-                }
-                
-                curl_close($ch);
-
-            } catch (\Exception $e) {
-                Log::error('Claude streaming error: ' . $e->getMessage());
-                echo "data: " . json_encode(['content' => '', 'error' => $e->getMessage()]) . "\n\n";
-            }
-
-            // Save to database
-            if (Auth::check() && $request->conversation_id) {
-                $this->saveConversation($request, $fullContent, $uploadedFilePath, $fileContentMessage, $expert);
-            }
-
-            Log::info('Claude stream completed', ['total_chunks' => $chunkCount]);
-            echo "data: [DONE]\n\n";
-            ob_flush();
-            flush();
-
-            // Deduct tokens
-            try {
-                $totalTokenCount = 0;
-                foreach ($messages as $msg) {
-                    $encodedMessage = json_encode($msg);
-                    $totalTokenCount += approximateTokenCount($encodedMessage);
-                }
-                $totalTokenCount += approximateTokenCount($fullContent);
-
-                if (Auth::check()) {
-                    deductUserTokensAndCredits($totalTokenCount, 0, $modelToUse);
-                    Log::info("Deducted {$totalTokenCount} tokens for Claude");
-                }
-            } catch (\Exception $e) {
-                Log::error('Error deducting tokens: ' . $e->getMessage());
-            }
-
-        }, 200, [
-            'Content-Type' => 'text/event-stream',
-            'Cache-Control' => 'no-cache',
-            'Connection' => 'keep-alive',
-            'X-Accel-Buffering' => 'no',
-        ]);
-    }
-
-    private function createStreamedResponse($response, $request, $fileContentMessage, $uploadedFilePath, $messages, $expert, $modelToUse, $apiType)
-    {
-        return new StreamedResponse(function () use ($response, $request, $fileContentMessage, $uploadedFilePath, $messages, $expert, $modelToUse) {
-            header('Content-Type: text/event-stream');
-            header('Cache-Control: no-cache');
-            header('Connection: keep-alive');
-            header('X-Accel-Buffering: no');
-
-            $chunkCount = 0;
-            $fullContent = '';
-
-            foreach ($response as $chunk) {
-                $content = $chunk->choices[0]->delta->content ?? '';
-                $fullContent .= $content;
-                $chunkCount++;
-
-                if (connection_aborted()) {
-                    Log::warning('Client disconnected early');
-                    break;
-                }
-
-                echo "data: " . json_encode(['content' => $content]) . "\n\n";
-                ob_flush();
-                flush();
-
-                usleep(50000);
-            }
-
-            // Save to database
-            if (Auth::check() && $request->conversation_id) {
-                $this->saveConversation($request, $fullContent, $uploadedFilePath, $fileContentMessage, $expert);
-            }
-
-            Log::info('Stream completed', ['total_chunks' => $chunkCount]);
-            echo "data: [DONE]\n\n";
-            ob_flush();
-            flush();
-            
-            // Deduct tokens
-            try {
-                $totalTokenCount = 0;
-                foreach ($messages as $msg) {
-                    $encodedMessage = json_encode($msg);
-                    $totalTokenCount += approximateTokenCount($encodedMessage);
-                }
-                $totalTokenCount += approximateTokenCount($fullContent);
-
-                if (Auth::check()) {
-                    deductUserTokensAndCredits($totalTokenCount, 0, $modelToUse);
-                    Log::info("Deducted {$totalTokenCount} tokens");
-                }
-            } catch (\Exception $e) {
-                Log::error('Error deducting tokens: ' . $e->getMessage());
-            }
-
-        }, 200, [
-            'Content-Type' => 'text/event-stream',
-            'Cache-Control' => 'no-cache',
-            'Connection' => 'keep-alive',
-            'X-Accel-Buffering' => 'no',
-        ]);
-    }
-
-    private function saveConversation($request, $fullContent, $uploadedFilePath, $fileContentMessage, $expert)
-    {
-        $conversation = ChatConversation::where('id', $request->conversation_id)
-            ->where('user_id', Auth::id())
-            ->first();
-
-        if ($conversation) {
-            if ($expert && $conversation->expert_id !== $expert->id) {
-                $conversation->expert_id = $expert->id;
-                $conversation->save();
-            }
-            
-            $userMessage = ChatMessage::create([
-                'conversation_id' => $conversation->id,
-                'role' => 'user',
-                'content' => $request->message,
-            ]);
-
-            if ($uploadedFilePath) {
-                ChatAttachment::create([
-                    'message_id' => $userMessage->id,
-                    'file_path' => $uploadedFilePath['file_path'],
-                    'file_name' => $uploadedFilePath['file_name'],
-                ]);
-            }
-
-            if ($fileContentMessage) {
-                ChatMessage::create([
-                    'conversation_id' => $conversation->id,
-                    'role' => 'system',
-                    'content' => is_array($fileContentMessage['content']) 
-                        ? json_encode($fileContentMessage['content']) 
-                        : $fileContentMessage['content'],
-                ]);
-            }
-
-            ChatMessage::create([
-                'conversation_id' => $conversation->id,
-                'role' => 'assistant',
-                'content' => trim($fullContent),
-            ]);
-
-            if ($conversation->title === 'New Chat') {
-                $title = substr($request->message, 0, 50);
-                if (strlen($request->message) > 50) {
-                    $title .= '...';
-                }
-                $conversation->update(['title' => $title]);
-            }
-        }
-    }
-
-    public function saveChat(Request $request)
-    {
-        if (!Auth::check()) {
-            return response()->json(['error' => 'Unauthorized'], 401);
-        }
-
-        $request->validate([
-            'title' => 'required|string|max:255',
-            'messages' => 'nullable|array'
-        ]);
-
-        $conversation = ChatConversation::create([
-            'user_id' => Auth::id(),
-            'title' => $request->title,
-        ]);
-
-        if ($request->messages) {
-            foreach ($request->messages as $message) {
-                ChatMessage::create([
-                    'conversation_id' => $conversation->id,
-                    'role' => $message['role'],
-                    'content' => $message['content'],
-                    'id' => $message['id'] ?? null,
-                ]);
-            }
-        }
-
-        return response()->json([
-            'success' => true,
-            'conversation_id' => $conversation->id
-        ]);
-    }
-
-    private function handleImageGeneration(Request $request, User $user)
-    {
-        $creditCheck = checkUserHasCredits();
-        if (!$creditCheck['status']) {
-            return response()->json([
-                'error' => $creditCheck['message']
-            ], 400);
-        }
-
-        $prompt = $request->message;
-        $currentModel = $user->selected_model;
-
-        Log::info('Image generation requested', ['prompt' => $prompt, 'current_model' => $currentModel]);
-        
-        try {
-            // Determine which image generation service to use based on current model
-            if ($this->isGrokModel($currentModel)) {
-                // If current model is Grok, use Grok image generation
-                return $this->handleGrokImageGeneration($request, $user, $prompt);
-            } elseif ($this->isClaudeModel($currentModel)) {
-                // Claude doesn't support image generation
-                return response()->json([
-                    'error' => 'Image generation is not supported with Claude models. Please switch to an OpenAI, Grok, or Gemini model.'
-                ], 400);
-            } elseif ($this->isGeminiModel($currentModel)) {
-                // Gemini supports image generation and editing
-                return $this->handleGeminiImageGeneration($request, $user, $prompt);
-            } else {
-                // For OpenAI models, determine which image generation model to use
-                $imageModel = 'dall-e-3'; // Default to DALL-E 3
-
-                // Check if current model supports image generation directly
-                $modelLower = strtolower($currentModel);
-                if (strpos($modelLower, 'gpt-image') !== false) {
-                    // Use the gpt-image model if specified
-                    $imageModel = $currentModel;
-                } elseif (strpos($modelLower, 'dall-e') !== false) {
-                    // Use the specified DALL-E model
-                    $imageModel = $currentModel;
-                }
-
-                Log::info('OpenAI image generation', [
-                    'current_model' => $currentModel,
-                    'image_model' => $imageModel
-                ]);
-
-                $response = OpenAI::images()->create([
-                    'model' => $imageModel,
-                    'prompt' => $prompt,
-                    'n' => 1,
-                    'size' => '1024x1024',
-                    'quality' => 'hd',
-                    'style' => 'vivid',
-                ]);
-
-                deductUserTokensAndCredits(0, 8);
-                $imageUrl = $response->data[0]->url;
-
-                // Upload to Azure (existing code)
-                $imageContent = file_get_contents($imageUrl);
-                $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
-                $containerName = config('filesystems.disks.azure.container');
-                $imageName = 'chattermate-images/' . uniqid() . '.png';
-                $blobClient->createBlockBlob($containerName, $imageName, $imageContent);
-
-                $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
-                $publicUrl = "{$baseUrl}/{$containerName}/{$imageName}";
-
-                // Save to database
-                if (Auth::check() && $request->conversation_id) {
-                    $conversation = ChatConversation::where('id', $request->conversation_id)
-                        ->where('user_id', Auth::id())
-                        ->first();
-
-                    if ($conversation) {
-                        $userMessage = ChatMessage::create([
-                            'conversation_id' => $conversation->id,
-                            'role' => 'user',
-                            'content' => $prompt,
-                        ]);
-
-                        $assistantMessage = ChatMessage::create([
-                            'conversation_id' => $conversation->id,
-                            'role' => 'assistant',
-                            'content' => $publicUrl,
-                        ]);
-
-                        if ($conversation->title === 'New Chat') {
-                            $title = substr($prompt, 0, 50);
-                            if (strlen($prompt) > 50) {
-                                $title .= '...';
-                            }
-                            $conversation->update(['title' => $title]);
-                        }
-                    }
-                }
-
-                return new StreamedResponse(function () use ($publicUrl, $prompt, $request) {
-                    echo "data: " . json_encode([
-                        'image' => $publicUrl,
-                        'prompt' => $prompt
-                    ]) . "\n\n";
-                    ob_flush();
-                    flush();
-                    
-                    echo "data: [DONE]\n\n";
-                    ob_flush();
-                    flush();
-                }, 200, [
-                    'Content-Type' => 'text/event-stream',
-                    'Cache-Control' => 'no-cache',
-                    'Connection' => 'keep-alive',
-                    'X-Accel-Buffering' => 'no',
-                ]);
-            }
-
-        } catch (\Exception $e) {
-            Log::error('Image generation failed: ' . $e->getMessage());
-            return response()->json(['error' => 'Image generation failed: ' . $e->getMessage()], 500);
-        }
-    }
-
-    private function handleGrokImageGeneration(Request $request, User $user, $prompt)
-    {
-        $apiKey = config('services.xai.api_key');
-        
-        try {
-            $ch = curl_init('https://api.x.ai/v1/images/generations');
-            
-            $payload = [
-                'model' => 'grok-2-image-1212',
-                'prompt' => $prompt,
-                'image_format' => 'url'
-            ];
-            
-            Log::debug('Grok Image Generation Payload', ['payload' => $payload]);
-            
-            curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_POST => true,
-                CURLOPT_HTTPHEADER => [
-                    'Content-Type: application/json',
-                    'Authorization: Bearer ' . $apiKey,
-                ],
-                CURLOPT_POSTFIELDS => json_encode($payload)
-            ]);
-
-            $response = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-
-            if ($httpCode !== 200) {
-                Log::error('Grok image generation failed', [
-                    'http_code' => $httpCode, 
-                    'response' => $response,
-                    'payload' => $payload
-                ]);
-                throw new \Exception('Grok API returned error: ' . $httpCode . ' - ' . $response);
-            }
-
-            $data = json_decode($response, true);
-            
-            if (!isset($data['data'][0]['url'])) {
-                Log::error('Unexpected Grok API response format', ['response' => $data]);
-                throw new \Exception('Unexpected API response format');
-            }
-            
-            $imageUrl = $data['data'][0]['url'];
-
-            deductUserTokensAndCredits(0, 8); // Adjust credits as needed
-
-            // Upload to Azure
-            $imageContent = file_get_contents($imageUrl);
-            $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
-            $containerName = config('filesystems.disks.azure.container');
-            $imageName = 'chattermate-images/' . uniqid() . '_grok.png';
-            $blobClient->createBlockBlob($containerName, $imageName, $imageContent);
-
-            $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
-            $publicUrl = "{$baseUrl}/{$containerName}/{$imageName}";
-
-            // Save to database
-            if (Auth::check() && $request->conversation_id) {
-                $conversation = ChatConversation::where('id', $request->conversation_id)
-                    ->where('user_id', Auth::id())
-                    ->first();
-
-                if ($conversation) {
-                    $userMessage = ChatMessage::create([
-                        'conversation_id' => $conversation->id,
-                        'role' => 'user',
-                        'content' => $prompt,
-                    ]);
-
-                    $assistantMessage = ChatMessage::create([
-                        'conversation_id' => $conversation->id,
-                        'role' => 'assistant',
-                        'content' => $publicUrl,
-                    ]);
-
-                    if ($conversation->title === 'New Chat') {
-                        $title = substr($prompt, 0, 50);
-                        if (strlen($prompt) > 50) {
-                            $title .= '...';
-                        }
-                        $conversation->update(['title' => $title]);
-                    }
-                }
-            }
-
-            return new StreamedResponse(function () use ($publicUrl, $prompt) {
-                echo "data: " . json_encode([
-                    'image' => $publicUrl,
-                    'prompt' => $prompt
-                ]) . "\n\n";
-                ob_flush();
-                flush();
-                
-                echo "data: [DONE]\n\n";
-                ob_flush();
-                flush();
-            }, 200, [
-                'Content-Type' => 'text/event-stream',
-                'Cache-Control' => 'no-cache',
-                'Connection' => 'keep-alive',
-                'X-Accel-Buffering' => 'no',
-            ]);
-
-        } catch (\Exception $e) {
-            Log::error('Grok image generation failed: ' . $e->getMessage());
-            throw $e;
-        }
-    }
-
-    private function handleGeminiImageGeneration(Request $request, User $user, $prompt)
-    {
-        try {
-            // Check if user uploaded an image for editing
-            $imagePath = null;
-            if ($request->hasFile('pdf')) {
-                $file = $request->file('pdf');
-                $allowedImageTypes = ['png', 'jpg', 'jpeg', 'webp', 'gif'];
-                $extension = strtolower($file->getClientOriginalExtension());
-
-                if (in_array($extension, $allowedImageTypes)) {
-                    // Upload image to Azure first
-                    $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
-                    $containerName = config('filesystems.disks.azure.container');
-
-                    $originalFileName = $file->getClientOriginalName();
-                    $sanitizedFileName = preg_replace('/[^A-Za-z0-9\-_\.]/', '-', $originalFileName);
-                    $sanitizedFileName = preg_replace('/-+/', '-', $sanitizedFileName);
-
-                    $imageName = 'chattermate-attachments/' . $sanitizedFileName;
-                    $imageContent = file_get_contents($file->getRealPath());
-                    $blobClient->createBlockBlob($containerName, $imageName, $imageContent, new CreateBlockBlobOptions());
-
-                    $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
-                    $imagePath = "{$baseUrl}/{$containerName}/{$imageName}";
-
-                    Log::info('Gemini image editing - uploaded input image', ['path' => $imagePath]);
-                }
-            }
-
-            // Check conversation history for previous images
-            $conversationHistory = null;
-            if ($request->conversation_id) {
-                $messages = ChatMessage::where('conversation_id', $request->conversation_id)
-                    ->orderBy('created_at', 'asc')
-                    ->get();
-                $conversationHistory = $messages->toArray();
-            }
-
-            // Generate/edit image using Gemini
-            $tempImageFile = $this->generateGeminiImage($prompt, $imagePath, $conversationHistory);
-
-            if (!$tempImageFile || !file_exists($tempImageFile)) {
-                throw new \Exception('Failed to generate image with Gemini');
-            }
-
-            // Upload to Azure
-            $imageContent = file_get_contents($tempImageFile);
-            $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
-            $containerName = config('filesystems.disks.azure.container');
-            $azureImageName = 'chattermate-images/' . uniqid() . '_gemini.png';
-            $blobClient->createBlockBlob($containerName, $azureImageName, $imageContent);
-
-            $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
-            $publicUrl = "{$baseUrl}/{$containerName}/{$azureImageName}";
-
-            // Clean up temp file
-            @unlink($tempImageFile);
-
-            // Deduct credits (adjust as needed - similar to other image generation)
-            deductUserTokensAndCredits(0, 8);
-
-            // Save to database
-            if (Auth::check() && $request->conversation_id) {
-                $conversation = ChatConversation::where('id', $request->conversation_id)
-                    ->where('user_id', Auth::id())
-                    ->first();
-
-                if ($conversation) {
-                    $userMessage = ChatMessage::create([
-                        'conversation_id' => $conversation->id,
-                        'role' => 'user',
-                        'content' => $prompt,
-                    ]);
-
-                    $assistantMessage = ChatMessage::create([
-                        'conversation_id' => $conversation->id,
-                        'role' => 'assistant',
-                        'content' => $publicUrl,
-                    ]);
-
-                    if ($conversation->title === 'New Chat') {
-                        $title = substr($prompt, 0, 50);
-                        if (strlen($prompt) > 50) {
-                            $title .= '...';
-                        }
-                        $conversation->update(['title' => $title]);
-                    }
-                }
-            }
-
-            return new StreamedResponse(function () use ($publicUrl, $prompt) {
-                echo "data: " . json_encode([
-                    'type' => 'message',
-                    'content' => $publicUrl
-                ]) . "\n\n";
-                ob_flush();
-                flush();
-
-                echo "data: " . json_encode([
-                    'type' => 'done'
-                ]) . "\n\n";
-                ob_flush();
-                flush();
-
-                echo "data: [DONE]\n\n";
-                ob_flush();
-                flush();
-            }, 200, [
-                'Content-Type' => 'text/event-stream',
-                'Cache-Control' => 'no-cache',
-                'Connection' => 'keep-alive',
-                'X-Accel-Buffering' => 'no',
-            ]);
-
-        } catch (\Exception $e) {
-            Log::error('Gemini image generation failed: ' . $e->getMessage(), [
-                'trace' => $e->getTraceAsString()
-            ]);
-            throw $e;
-        }
-    }
-
-    public function getChats(Request $request)
-    {
-        if (!Auth::check()) {
-            return response()->json(['error' => 'Unauthorized'], 401);
-        }
-
-        $conversations = ChatConversation::where('user_id', Auth::id())->whereNull('expert_id')
-            ->orderBy('updated_at', 'desc')
-            ->get(['id', 'title', 'created_at', 'updated_at']);
-
-        return response()->json($conversations);
-    }
-   
-    public function getExpertChats(Request $request)
-    {
-        if (!Auth::check()) {
-            return response()->json(['error' => 'Unauthorized'], 401);
-        }
-
-        $query = ChatConversation::where('user_id', Auth::id())
-                    ->whereNotNull('expert_id')
-                    ->whereHas('expert', function ($query) {
-                        $query->where('domain', 'expert-chat');
-                    });
-
-        // Add expert filter if provided
-        if ($request->has('expert_id') && $request->expert_id) {
-            $query->where('expert_id', $request->expert_id);
-        }
-
-        $conversations = $query->orderBy('updated_at', 'desc')
-                    ->get(['id', 'title', 'created_at', 'updated_at', 'expert_id']);
-
-        return response()->json($conversations);
-    }
-
-    public function getAiTutorExpertChats(Request $request)
-    {
-          if (!Auth::check()) {
-            return response()->json(['error' => 'Unauthorized'], 401);
-        }
-
-        $query = ChatConversation::where('user_id', Auth::id())
-                    ->whereNotNull('expert_id')
-                    ->whereHas('expert', function ($query) {
-                        $query->where('domain', 'ai-tutor');
-                    });
-
-        // Add expert filter if provided
-        if ($request->has('expert_id') && $request->expert_id) {
-            $query->where('expert_id', $request->expert_id);
-        }
-
-        $conversations = $query->orderBy('updated_at', 'desc')
-                    ->get(['id', 'title', 'created_at', 'updated_at', 'expert_id']);
-
-        return response()->json($conversations);
-    }
-
-
-    public function getConversation($id)
-    {
-        if (!Auth::check()) {
-            return response()->json(['error' => 'Unauthorized'], 401);
-        }
-
-        // Eager load messages and their attachment, and expert
-        $conversation = ChatConversation::with(['messages.attachment', 'expert'])
-            ->where('id', $id)
-            ->where('user_id', Auth::id())
-            ->first();
-
-        if (!$conversation) {
-            return response()->json(['error' => 'Conversation not found'], 404);
-        }
-
-        return response()->json([
-            'title' => $conversation->title,
-            'expert_name' => $conversation->expert ? $conversation->expert->expert_name : null,
-            'messages' => $conversation->messages->map(function ($message) {
-                return [
-                    'role' => $message->role,
-                    'content' => $message->content,
-                    'attachment' => $message->attachment ? [
-                        'url' => (function() use ($message) {
-                            $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
-                            $containerName = config('filesystems.disks.azure.container');
-                            $encodedPath = implode('/', array_map('rawurlencode', explode('/', $message->attachment->file_path)));
-                            return "{$baseUrl}/{$containerName}/{$encodedPath}";
-                        })(),
-                        'name' => $message->attachment->file_name,
-                    ] : null
-                ];
-            })
-        ]);
-    }
-
-
-    // DELETE CONVERSATION
-    public function deleteConversation($id)
-    {
-        if (!Auth::check()) {
-            return response()->json(['error' => 'Unauthorized'], 401);
-        }
-
-        $conversation = ChatConversation::where('id', $id)
-            ->where('user_id', Auth::id())
-            ->first();
-
-        if (!$conversation) {
-            return response()->json(['error' => 'Conversation not found'], 404);
-        }
-
-        $conversation->delete();
-
-        return response()->json(['success' => true]);
-    }
-
     // Multi-Compare Interface
     public function index($hexCode = null)
     {
@@ -2791,6 +692,7 @@ class CompareController extends Controller
             return $domainGroup->groupBy('category');
         });
 
+        /** @var \App\Models\User $user */
         $user = \Illuminate\Support\Facades\Auth::user();
 
         $siteSettings = app('siteSettings');
@@ -2840,125 +742,6 @@ class CompareController extends Controller
         ));
     }
 
-
-    public function chatPDF(Request $request)
-    {
-        $request->validate([
-            'message' => 'required|string',
-            'pdf' => 'required|file|mimes:pdf|max:10240', // 10MB max
-        ]);
-
-        $tempPath = $request->file('pdf')->storeAs('temp', uniqid() . '.pdf');
-        $fullPath = storage_path("app/{$tempPath}");
-
-        $parser = new PdfParser();
-        $pdf = $parser->parseFile($fullPath);
-        $text = substr($pdf->getText(), 0, 8000); // 8K token limit (adjust if needed)
-
-        // Delete after parsing
-        Storage::delete($tempPath);
-
-        $prompt = "The following is content from a PDF:\n\n{$text}\n\nUser Question: " . $request->message;
-
-        $messages = [
-            ['role' => 'system', 'content' => 'You are an assistant that answers questions based on the provided document.'],
-            ['role' => 'user', 'content' => $prompt],
-        ];
-
-        $response = OpenAI::chat()->createStreamed([
-            'model' => 'gpt-4',
-            'messages' => $messages,
-            'stream' => true,
-        ]);
-
-        return new StreamedResponse(function () use ($response) {
-            header('Content-Type: text/event-stream');
-            header('Cache-Control: no-cache');
-            header('Connection: keep-alive');
-            header('X-Accel-Buffering: no');
-
-            foreach ($response as $chunk) {
-                $content = $chunk->choices[0]->delta->content ?? '';
-                echo "data: " . json_encode(['content' => $content]) . "\n\n";
-                ob_flush();
-                flush();
-            }
-        }, 200, [
-            'Content-Type' => 'text/event-stream',
-            'Cache-Control' => 'no-cache',
-            'Connection' => 'keep-alive',
-            'X-Accel-Buffering' => 'no',
-        ]);
-    }
-
-    public function translate(Request $request)
-    {
-        $request->validate([
-            'text' => 'required|string',
-            'target_lang' => 'required|string',
-        ]);
-
-        try {
-            $response = OpenAI::chat()->create([
-                'model' => 'gpt-4o-mini', // or 'gpt-4.1-mini'
-                'messages' => [
-                    ['role' => 'system', 'content' => "You are a translator. Translate the text into {$request->target_lang}."],
-                    ['role' => 'user', 'content' => $request->text],
-                ],
-            ]);
-
-            $translation = $response->choices[0]->message->content;
-
-            return response()->json([
-                'success' => true,
-                'translation' => $translation,
-            ]);
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'error' => $e->getMessage(),
-            ], 500);
-        }
-    }
-
-    // Edit CHat Title
-    public function updateConversationTitle(Request $request, $id)
-    {
-        $request->validate([
-            'title' => 'required|string|max:255'
-        ]);
-        
-        $conversation = ChatConversation::where('id', $id)
-            ->where('user_id', Auth::id())
-            ->first();
-        
-        if (!$conversation) {
-            return response()->json(['success' => false, 'error' => 'Conversation not found'], 404);
-        }
-        
-        $conversation->title = $request->title;
-        $conversation->save();
-        
-        return response()->json(['success' => true, 'title' => $conversation->title]);
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
-
-
-
-
     public function multiModelChat(Request $request)
     {
         set_time_limit(300);
@@ -2995,8 +778,9 @@ class CompareController extends Controller
         $useWebSearch = $request->boolean('web_search');
         $createImage = $request->boolean('create_image');
         $optimizationMode = $request->input('optimization_mode', 'fixed');
+        /** @var \App\Models\User $user */
         $user = auth()->user();
-        
+
         // ✅ TOKEN RESTRICTION ENFORCEMENT
         $siteSettings = app('siteSettings');
         $defaultModel = $siteSettings->default_model ?? null;
@@ -3241,7 +1025,7 @@ class CompareController extends Controller
             }
         }
 
-        if ($hasLowTokens && $defaultModel && Auth::user()->role === 'admin') {
+        if ($hasLowTokens && $defaultModel && $user->role === 'admin') {
             Log::warning('User has low tokens, enforcing default model restriction', [
                 'user_id' => $user->id,
                 'tokens_left' => $user->tokens_left,
@@ -3966,6 +1750,7 @@ class CompareController extends Controller
             }
 
             // ✅ Send updated token status
+            /** @var \App\Models\User $updatedUser */
             $updatedUser = Auth::user()->fresh(); // Refresh user data
             $updatedTokens = $updatedUser->tokens_left;
 
@@ -5865,303 +3650,6 @@ class CompareController extends Controller
         }
     }
 
-    // Add this helper to convert image to base64 for API calls
-    private function imageToBase64($imageUrl)
-    {
-        try {
-            $imageData = file_get_contents($imageUrl);
-            return base64_encode($imageData);
-        } catch (\Exception $e) {
-            Log::error('Image conversion error: ' . $e->getMessage());
-            return null;
-        }
-    }
-
-    private function processModelStream($model, $messages, $useWebSearch, &$responses)
-    {
-        if ($this->isClaudeModel($model)) {
-            $this->processClaudeModel($model, $messages, $useWebSearch, $responses);
-        } elseif ($this->isGeminiModel($model)) {
-            $this->processGeminiModel($model, $messages, $useWebSearch, $responses);
-        } elseif ($this->isGrokModel($model)) {
-            $this->processGrokModel($model, $messages, $useWebSearch, $responses);
-        } else {
-            $this->processOpenAIModel($model, $messages, $useWebSearch, $responses);
-        }
-    }
-
-    private function processOpenAIModel($model, $messages, $useWebSearch, &$responses)
-    {
-        $apiKey = config('services.openai.api_key');
-        
-        $modelToUse = $useWebSearch ? 'gpt-4o-search-preview' : $model;
-        
-        $payload = [
-            'model' => $modelToUse,
-            'messages' => $messages,
-            'stream' => true,
-            'temperature' => 0.7,
-            'max_tokens' => 4096,
-        ];
-
-        Log::info("Starting OpenAI request", [
-            'model' => $modelToUse,
-            'message_count' => count($messages),
-            'api_key_length' => strlen($apiKey)
-        ]);
-
-        $ch = curl_init('https://api.openai.com/v1/chat/completions');
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => false,
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
-                'Authorization: Bearer ' . $apiKey,
-            ],
-            CURLOPT_POSTFIELDS => json_encode($payload),
-            CURLOPT_WRITEFUNCTION => function ($ch, $data) use ($model, &$responses) {
-                return $this->handleStreamChunk($model, $data, $responses, 'openai');
-            }
-        ]);
-
-        curl_exec($ch);
-        curl_close($ch);
-    }
-
-    // Keep the buffers for handling incomplete chunks
-    private static $buffers = [];
-    private static $chunkCounts = [];
-
-    private function handleStreamChunk($model, $data, &$responses, $provider)
-    {
-        // Initialize buffer and chunk count if not exists
-        if (!isset(self::$buffers[$model])) {
-            self::$buffers[$model] = '';
-            self::$chunkCounts[$model] = 0;
-        }
-
-        $buffers = &self::$buffers;
-        $chunkCounts = &self::$chunkCounts;
-
-        $buffers[$model] .= $data;
-        $lines = explode("\n", $buffers[$model]);
-        $buffers[$model] = array_pop($lines);
-
-        foreach ($lines as $line) {
-            $line = trim($line);
-            if (empty($line) || $line === 'data: [DONE]') {
-                continue;
-            }
-
-            if (strpos($line, 'data: ') === 0) {
-                $json = substr($line, 6);
-                
-                try {
-                    $decoded = json_decode($json, true);
-                    
-                    if (json_last_error() !== JSON_ERROR_NONE) {
-                        Log::warning("JSON parse error for {$provider}: " . json_last_error_msg());
-                        continue;
-                    }
-                    
-                    $content = '';
-                    
-                    if ($provider === 'claude') {
-                        if (isset($decoded['type']) && $decoded['type'] === 'content_block_delta') {
-                            $content = $decoded['delta']['text'] ?? '';
-                        }
-                    } elseif ($provider === 'gemini') {
-                        if (isset($decoded['candidates'][0]['content']['parts'])) {
-                            foreach ($decoded['candidates'][0]['content']['parts'] as $part) {
-                                if (isset($part['text'])) {
-                                    $content .= $part['text'];
-                                }
-                            }
-                        }
-                    } elseif ($provider === 'openai') {
-                        if (isset($decoded['choices'][0]['delta']['content'])) {
-                            $content = $decoded['choices'][0]['delta']['content'];
-                            $chunkCounts[$model]++;
-                            
-                            // Log every 10th chunk for OpenAI
-                            if ($chunkCounts[$model] % 10 === 0) {
-                                Log::debug("OpenAI chunk #{$chunkCounts[$model]} for {$model}: " . strlen($content) . " chars");
-                            }
-                        }
-                    } elseif ($provider === 'grok') {
-                        if (isset($decoded['choices'][0]['delta']['content'])) {
-                            $content = $decoded['choices'][0]['delta']['content'];
-                        }
-                    }
-
-                    if ($content !== '') {
-                        $responses[$model] .= $content;
-
-                        echo "data: " . json_encode([
-                            'type' => 'chunk',
-                            'model' => $model,
-                            'content' => $content,
-                            'full_response' => $responses[$model],
-                            'provider' => $provider,
-                            'chunk_count' => $chunkCounts[$model] ?? 0
-                        ]) . "\n\n";
-                        ob_flush();
-                        flush();
-                    }
-                    
-                } catch (\Exception $e) {
-                    Log::error("Error parsing JSON for {$model} ({$provider}): " . $e->getMessage());
-                    Log::error("Raw JSON (first 200 chars): " . substr($json, 0, 200));
-                }
-            }
-        }
-
-        return strlen($data);
-    }
-
-    private function processClaudeModel($model, $messages, $useWebSearch, &$responses)
-    {
-        $claudeData = $this->convertMessagesToClaudeFormat($messages);
-        
-        $payload = [
-            'model' => $model,
-            'messages' => $claudeData['messages'],
-            'max_tokens' => 4096,
-            'stream' => true,
-        ];
-
-        if ($claudeData['system']) {
-            $payload['system'] = $claudeData['system'];
-        }
-
-        if ($useWebSearch) {
-            $payload['tools'] = [
-                [
-                    'type' => 'web_search_20250305',
-                    'name' => 'web_search',
-                    'max_uses' => 5
-                ]
-            ];
-        }
-
-        $apiKey = config('services.anthropic.api_key');
-        
-        $ch = curl_init('https://api.anthropic.com/v1/messages');
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => false,
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
-                'x-api-key: ' . $apiKey,
-                'anthropic-version: 2023-06-01',
-            ],
-            CURLOPT_POSTFIELDS => json_encode($payload),
-            CURLOPT_WRITEFUNCTION => function ($ch, $data) use ($model, &$responses) {
-                return $this->handleStreamChunk($model, $data, $responses, 'claude');
-            }
-        ]);
-
-        curl_exec($ch);
-        curl_close($ch);
-    }
-
-    private function processGeminiModel($model, $messages, $useWebSearch, &$responses)
-    {
-        $geminiMessages = $this->convertMessagesToGeminiFormat($messages);
-        $apiKey = config('services.gemini.api_key');
-        
-        $endpoint = "https://generativelanguage.googleapis.com/v1beta/models/{$model}:streamGenerateContent?alt=sse&key={$apiKey}";
-        
-        $payload = [
-            'contents' => $geminiMessages['contents'],
-            'generationConfig' => [
-                'temperature' => 1.0,
-                'topK' => 40,
-                'topP' => 0.95,
-                'maxOutputTokens' => 8192,
-            ],
-        ];
-        
-        if ($geminiMessages['systemInstruction']) {
-            $payload['systemInstruction'] = [
-                'parts' => [
-                    ['text' => $geminiMessages['systemInstruction']]
-                ]
-            ];
-        }
-        
-        if ($useWebSearch) {
-            if (str_contains($model, '2.') || str_contains($model, 'flash-002')) {
-                $payload['tools'] = [['google_search' => (object)[]]];
-            } else {
-                $payload['tools'] = [[
-                    'googleSearchRetrieval' => [
-                        'dynamicRetrievalConfig' => [
-                            'mode' => 'MODE_DYNAMIC',
-                            'dynamicThreshold' => 0.7
-                        ]
-                    ]
-                ]];
-            }
-        }
-
-        $ch = curl_init($endpoint);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => false,
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-            CURLOPT_POSTFIELDS => json_encode($payload),
-            CURLOPT_WRITEFUNCTION => function ($ch, $data) use ($model, &$responses) {
-                return $this->handleStreamChunk($model, $data, $responses, 'gemini');
-            }
-        ]);
-
-        curl_exec($ch);
-        curl_close($ch);
-    }
-
-    private function processGrokModel($model, $messages, $useWebSearch, &$responses)
-    {
-        $apiKey = config('services.xai.api_key');
-        
-        $payload = [
-            'model' => $model,
-            'messages' => $messages,
-            'stream' => true,
-            'temperature' => 0.7,
-            'max_tokens' => 4096,
-        ];
-        
-        if ($useWebSearch) {
-            $currentDate = date('Y-m-d');
-            $lastMessage = end($messages);
-            if ($lastMessage && $lastMessage['role'] === 'user') {
-                $originalContent = $lastMessage['content'];
-                $messages[count($messages) - 1]['content'] = 
-                    "Current date: {$currentDate}. " . 
-                    "Please search for and use only the most recent, up-to-date information when answering: " . 
-                    $originalContent;
-            }
-            $payload['messages'] = $messages;
-        }
-
-        $ch = curl_init('https://api.x.ai/v1/chat/completions');
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => false,
-            CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => [
-                'Content-Type: application/json',
-                'Authorization: Bearer ' . $apiKey,
-            ],
-            CURLOPT_POSTFIELDS => json_encode($payload),
-            CURLOPT_WRITEFUNCTION => function ($ch, $data) use ($model, &$responses) {
-                return $this->handleStreamChunk($model, $data, $responses, 'grok');
-            }
-        ]);
-
-        curl_exec($ch);
-        curl_close($ch);
-    }
 
     private function saveMultiCompareConversation($conversation, $userMessage, $allResponses, $uploadedFiles = [], $fileContentMessages = [])
     {
@@ -6394,6 +3882,7 @@ class CompareController extends Controller
             ]);
 
             $format = $request->input('format');
+            /** @var \App\Models\User $user */
             $user = auth()->user();
 
             // Find the conversation
@@ -6631,523 +4120,547 @@ class CompareController extends Controller
     }
 
     // Archive/Unarchive single conversation
-public function toggleArchiveMultiCompareConversation($hexCode)
-{
-    $conversation = MultiCompareConversation::where('hex_code', $hexCode)
-        ->where('user_id', auth()->id())
-        ->firstOrFail();
+    public function toggleArchiveMultiCompareConversation($hexCode)
+    {
+        $conversation = MultiCompareConversation::where('hex_code', $hexCode)
+            ->where('user_id', auth()->id())
+            ->firstOrFail();
 
-    $conversation->update([
-        'archived' => !$conversation->archived
-    ]);
+        $conversation->update([
+            'archived' => !$conversation->archived
+        ]);
 
-    return response()->json([
-        'message' => $conversation->archived ? 'Conversation archived' : 'Conversation unarchived',
-        'archived' => $conversation->archived
-    ]);
-}
+        return response()->json([
+            'message' => $conversation->archived ? 'Conversation archived' : 'Conversation unarchived',
+            'archived' => $conversation->archived
+        ]);
+    }
 
-// Bulk delete conversations
-public function bulkDeleteMultiCompareConversations(Request $request)
-{
-    $request->validate([
-        'hex_codes' => 'required|array',
-        'hex_codes.*' => 'exists:multi_compare_conversations,hex_code'
-    ]);
+    // Bulk delete conversations
+    public function bulkDeleteMultiCompareConversations(Request $request)
+    {
+        $request->validate([
+            'hex_codes' => 'required|array',
+            'hex_codes.*' => 'exists:multi_compare_conversations,hex_code'
+        ]);
 
-    $deleted = MultiCompareConversation::whereIn('hex_code', $request->hex_codes)
-        ->where('user_id', auth()->id())
-        ->delete();
+        $deleted = MultiCompareConversation::whereIn('hex_code', $request->hex_codes)
+            ->where('user_id', auth()->id())
+            ->delete();
 
-    return response()->json([
-        'message' => "{$deleted} conversation(s) deleted successfully",
-        'deleted_count' => $deleted
-    ]);
-}
+        return response()->json([
+            'message' => "{$deleted} conversation(s) deleted successfully",
+            'deleted_count' => $deleted
+        ]);
+    }
 
-// Bulk archive/unarchive conversations
-public function bulkArchiveMultiCompareConversations(Request $request)
-{
-    $request->validate([
-        'hex_codes' => 'required|array',
-        'hex_codes.*' => 'exists:multi_compare_conversations,hex_code',
-        'archive' => 'required|boolean'
-    ]);
+    // Bulk archive/unarchive conversations
+    public function bulkArchiveMultiCompareConversations(Request $request)
+    {
+        $request->validate([
+            'hex_codes' => 'required|array',
+            'hex_codes.*' => 'exists:multi_compare_conversations,hex_code',
+            'archive' => 'required|boolean'
+        ]);
 
-    $updated = MultiCompareConversation::whereIn('hex_code', $request->hex_codes)
-        ->where('user_id', auth()->id())
-        ->update(['archived' => $request->archive]);
+        $updated = MultiCompareConversation::whereIn('hex_code', $request->hex_codes)
+            ->where('user_id', auth()->id())
+            ->update(['archived' => $request->archive]);
 
-    $action = $request->archive ? 'archived' : 'unarchived';
+        $action = $request->archive ? 'archived' : 'unarchived';
 
-    return response()->json([
-        'message' => "{$updated} conversation(s) {$action} successfully",
-        'updated_count' => $updated
-    ]);
-}
+        return response()->json([
+            'message' => "{$updated} conversation(s) {$action} successfully",
+            'updated_count' => $updated
+        ]);
+    }
 
-/**
- * Generate a shareable link for a conversation
- */
-public function generateShareLink(Request $request, $hexCode)
-{
-    $request->validate([
-        'expires_in_days' => 'nullable|integer|min:1|max:365',
-    ]);
+    /**
+     * Generate a shareable link for a conversation
+     */
+    public function generateShareLink(Request $request, $hexCode)
+    {
+        $request->validate([
+            'expires_in_days' => 'nullable|integer|min:1|max:365',
+        ]);
 
-    $conversation = MultiCompareConversation::where('hex_code', $hexCode)
-        ->where('user_id', auth()->id())
-        ->firstOrFail();
+        $conversation = MultiCompareConversation::where('hex_code', $hexCode)
+            ->where('user_id', auth()->id())
+            ->firstOrFail();
 
-    // Check if there's already an active share
-    $existingShare = $conversation->activeShare;
+        // Check if there's already an active share
+        $existingShare = $conversation->activeShare;
 
-    if ($existingShare) {
-        // Return existing share
-        $shareUrl = route('shared.conversation', ['token' => $existingShare->share_token]);
-        
+        if ($existingShare) {
+            // Return existing share
+            $shareUrl = route('shared.conversation', ['token' => $existingShare->share_token]);
+            
+            return response()->json([
+                'success' => true,
+                'share_token' => $existingShare->share_token,
+                'share_url' => $shareUrl,
+                'expires_at' => $existingShare->expires_at,
+                'view_count' => $existingShare->view_count,
+                'created_at' => $existingShare->created_at,
+            ]);
+        }
+
+        // Create new share
+        $expiresAt = null;
+        if ($request->has('expires_in_days')) {
+            $expiresAt = now()->addDays($request->expires_in_days);
+        }
+
+        $share = MultiCompareConversationShare::create([
+            'conversation_id' => $conversation->id,
+            'share_token' => MultiCompareConversationShare::generateToken(),
+            'created_by' => auth()->id(),
+            'is_public' => true,
+            'expires_at' => $expiresAt,
+        ]);
+
+        $shareUrl = route('shared.conversation', ['token' => $share->share_token]);
+
         return response()->json([
             'success' => true,
-            'share_token' => $existingShare->share_token,
+            'share_token' => $share->share_token,
             'share_url' => $shareUrl,
-            'expires_at' => $existingShare->expires_at,
-            'view_count' => $existingShare->view_count,
-            'created_at' => $existingShare->created_at,
+            'expires_at' => $share->expires_at,
+            'view_count' => 0,
+            'created_at' => $share->created_at,
         ]);
     }
 
-    // Create new share
-    $expiresAt = null;
-    if ($request->has('expires_in_days')) {
-        $expiresAt = now()->addDays($request->expires_in_days);
-    }
+    /**
+     * Revoke a share link
+     */
+    public function revokeShareLink($hexCode)
+    {
+        $conversation = MultiCompareConversation::where('hex_code', $hexCode)
+            ->where('user_id', auth()->id())
+            ->firstOrFail();
 
-    $share = MultiCompareConversationShare::create([
-        'conversation_id' => $conversation->id,
-        'share_token' => MultiCompareConversationShare::generateToken(),
-        'created_by' => auth()->id(),
-        'is_public' => true,
-        'expires_at' => $expiresAt,
-    ]);
+        $share = $conversation->activeShare;
 
-    $shareUrl = route('shared.conversation', ['token' => $share->share_token]);
+        if ($share) {
+            $share->update(['is_public' => false]);
+        }
 
-    return response()->json([
-        'success' => true,
-        'share_token' => $share->share_token,
-        'share_url' => $shareUrl,
-        'expires_at' => $share->expires_at,
-        'view_count' => 0,
-        'created_at' => $share->created_at,
-    ]);
-}
-
-/**
- * Revoke a share link
- */
-public function revokeShareLink($hexCode)
-{
-    $conversation = MultiCompareConversation::where('hex_code', $hexCode)
-        ->where('user_id', auth()->id())
-        ->firstOrFail();
-
-    $share = $conversation->activeShare;
-
-    if ($share) {
-        $share->update(['is_public' => false]);
-    }
-
-    return response()->json([
-        'success' => true,
-        'message' => 'Share link revoked successfully'
-    ]);
-}
-
-/**
- * Get share information
- */
-public function getShareInfo($hexCode)
-{
-    $conversation = MultiCompareConversation::where('hex_code', $hexCode)
-        ->where('user_id', auth()->id())
-        ->firstOrFail();
-
-    $share = $conversation->activeShare;
-
-    if (!$share) {
         return response()->json([
-            'success' => false,
-            'shared' => false,
+            'success' => true,
+            'message' => 'Share link revoked successfully'
         ]);
     }
 
-    $shareUrl = route('shared.conversation', ['token' => $share->share_token]);
+    /**
+     * Get share information
+     */
+    public function getShareInfo($hexCode)
+    {
+        $conversation = MultiCompareConversation::where('hex_code', $hexCode)
+            ->where('user_id', auth()->id())
+            ->firstOrFail();
 
-    return response()->json([
-        'success' => true,
-        'shared' => true,
-        'share_token' => $share->share_token,
-        'share_url' => $shareUrl,
-        'expires_at' => $share->expires_at,
-        'view_count' => $share->view_count,
-        'created_at' => $share->created_at,
-    ]);
-}
+        $share = $conversation->activeShare;
 
-/**
- * View a shared conversation (public access)
- */
-public function viewSharedConversation($token)
-{
-    $share = MultiCompareConversationShare::where('share_token', $token)
-        ->with(['conversation.messages.attachments'])
-        ->firstOrFail();
-
-    // Validate share
-    if (!$share->isValid()) {
-        abort(403, 'This shared link has expired or is no longer available.');
-    }
-
-    // Increment view count
-    $share->incrementViews();
-
-    $conversation = $share->conversation;
-
-    // Get models for display
-    $availableModels = \App\Models\AISettings::active()
-        ->whereNotNull('openaimodel')
-        ->whereNotNull('provider')
-        ->select('openaimodel', 'displayname', 'cost_per_m_tokens', 'provider')
-        ->orderBy('provider')
-        ->orderBy('displayname')
-        ->get()
-        ->groupBy('provider');
-
-    return view('backend.chattermate.shared-conversation', compact(
-        'conversation',
-        'share',
-        'availableModels'
-    ));
-}
-
-
-/**
- * Detect if message is an export request
- */
-private function detectFileExportRequest($message)
-{
-    $message = strtolower(trim($message));
-    
-    Log::info('Checking for export request', ['message' => $message]);
-    
-    $fileFormats = [
-        'csv' => 'csv',
-        'excel' => 'xlsx',
-        'xlsx' => 'xlsx',
-        'spreadsheet' => 'xlsx',
-        'pdf' => 'pdf',
-        'word' => 'docx',
-        'docx' => 'docx',
-        'document' => 'docx',
-        'text' => 'txt',
-        'txt' => 'txt',
-        'notepad' => 'txt',
-        'powerpoint' => 'pptx',
-        'ppt' => 'pptx',
-        'presentation' => 'pptx',
-        'slide' => 'pptx',
-    ];
-    
-    // ✅ FIRST: Check if ANY format is mentioned
-    $formatFound = null;
-    foreach ($fileFormats as $keyword => $format) {
-        if (str_contains($message, $keyword)) {
-            $formatFound = $format;
-            Log::info('Format detected', ['keyword' => $keyword, 'format' => $format]);
-            break;
-        }
-    }
-    
-    // ✅ If no format mentioned, NOT an export request
-    if (!$formatFound) {
-        Log::info('No file format detected in message');
-        return null;
-    }
-    
-    // ✅ IMPROVED: Check for export intent words
-    $exportWords = [
-        'export',
-        'download',
-        'save',
-        'convert',
-        'generate',
-    ];
-    
-    $hasExportWord = false;
-    foreach ($exportWords as $word) {
-        if (str_contains($message, $word)) {
-            $hasExportWord = true;
-            Log::info('Export word detected', ['word' => $word]);
-            break;
-        }
-    }
-    
-    if (!$hasExportWord) {
-        Log::info('No export intent word found');
-        return null;
-    }
-    
-    // ✅ NEW: Check for CREATION phrases (these override export intent)
-    // These are requests to CREATE new content, not export existing
-    $creationPhrases = [
-        'write a',
-        'write an',
-        'create a',
-        'create an',
-        'make a',
-        'make an',
-        'build a',
-        'build an',
-        'design a',
-        'design an',
-        'show me a',
-        'show me an',
-        'give me a',
-        'give me an',
-        'provide a',
-        'provide an',
-    ];
-    
-    foreach ($creationPhrases as $phrase) {
-        if (str_contains($message, $phrase)) {
-            Log::info('Content creation phrase detected, not an export', [
-                'phrase' => $phrase
+        if (!$share) {
+            return response()->json([
+                'success' => false,
+                'shared' => false,
             ]);
+        }
+
+        $shareUrl = route('shared.conversation', ['token' => $share->share_token]);
+
+        return response()->json([
+            'success' => true,
+            'shared' => true,
+            'share_token' => $share->share_token,
+            'share_url' => $shareUrl,
+            'expires_at' => $share->expires_at,
+            'view_count' => $share->view_count,
+            'created_at' => $share->created_at,
+        ]);
+    }
+
+    /**
+     * View a shared conversation (public access)
+     */
+    public function viewSharedConversation($token)
+    {
+        $share = MultiCompareConversationShare::where('share_token', $token)
+            ->with(['conversation.messages.attachments'])
+            ->firstOrFail();
+
+        // Validate share
+        if (!$share->isValid()) {
+            abort(403, 'This shared link has expired or is no longer available.');
+        }
+
+        // Increment view count
+        $share->incrementViews();
+
+        $conversation = $share->conversation;
+
+        // Get models for display
+        $availableModels = \App\Models\AISettings::active()
+            ->whereNotNull('openaimodel')
+            ->whereNotNull('provider')
+            ->select('openaimodel', 'displayname', 'cost_per_m_tokens', 'provider')
+            ->orderBy('provider')
+            ->orderBy('displayname')
+            ->get()
+            ->groupBy('provider');
+
+        return view('backend.chattermate.shared-conversation', compact(
+            'conversation',
+            'share',
+            'availableModels'
+        ));
+    }
+
+    /**
+     * Detect if message is an export request
+     */
+    private function detectFileExportRequest($message)
+    {
+        $message = strtolower(trim($message));
+        
+        Log::info('Checking for export request', ['message' => $message]);
+        
+        $fileFormats = [
+            'csv' => 'csv',
+            'excel' => 'xlsx',
+            'xlsx' => 'xlsx',
+            'spreadsheet' => 'xlsx',
+            'pdf' => 'pdf',
+            'word' => 'docx',
+            'docx' => 'docx',
+            'document' => 'docx',
+            'text' => 'txt',
+            'txt' => 'txt',
+            'notepad' => 'txt',
+            'powerpoint' => 'pptx',
+            'ppt' => 'pptx',
+            'presentation' => 'pptx',
+            'slide' => 'pptx',
+        ];
+        
+        // ✅ FIRST: Check if ANY format is mentioned
+        $formatFound = null;
+        foreach ($fileFormats as $keyword => $format) {
+            if (str_contains($message, $keyword)) {
+                $formatFound = $format;
+                Log::info('Format detected', ['keyword' => $keyword, 'format' => $format]);
+                break;
+            }
+        }
+        
+        // ✅ If no format mentioned, NOT an export request
+        if (!$formatFound) {
+            Log::info('No file format detected in message');
             return null;
         }
-    }
-    
-    // ✅ NEW: Specific patterns that indicate CREATION, not EXPORT
-    // Example: "generate a pdf with a chart" = CREATE
-    // Example: "export as pdf" = EXPORT
-    $creationPatterns = [
-        '/generate\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
-        '/create\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
-        '/make\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
-        '/write\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
-    ];
-    
-    foreach ($creationPatterns as $pattern) {
-        if (preg_match($pattern, $message)) {
-            Log::info('Creation pattern matched, not an export', [
-                'pattern' => $pattern
-            ]);
+        
+        // ✅ IMPROVED: Check for export intent words
+        $exportWords = [
+            'export',
+            'download',
+            'save',
+            'convert',
+            'generate',
+        ];
+        
+        $hasExportWord = false;
+        foreach ($exportWords as $word) {
+            if (str_contains($message, $word)) {
+                $hasExportWord = true;
+                Log::info('Export word detected', ['word' => $word]);
+                break;
+            }
+        }
+        
+        if (!$hasExportWord) {
+            Log::info('No export intent word found');
             return null;
         }
-    }
-    
-    // ✅ NEW: Strong export indicators
-    $strongExportIndicators = [
-        'export as',
-        'export to',
-        'export the',
-        'export this',
-        'export that',
-        'download as',
-        'download the',
-        'download this',
-        'download that',
-        'save as',
-        'save the',
-        'save this',
-        'save that',
-        'convert to',
-        'convert the',
-        'convert this',
-        'convert that',
-    ];
-    
-    $hasStrongIndicator = false;
-    foreach ($strongExportIndicators as $indicator) {
-        if (str_contains($message, $indicator)) {
-            $hasStrongIndicator = true;
-            Log::info('Strong export indicator found', ['indicator' => $indicator]);
-            break;
+        
+        // ✅ NEW: Check for CREATION phrases (these override export intent)
+        // These are requests to CREATE new content, not export existing
+        $creationPhrases = [
+            'write a',
+            'write an',
+            'create a',
+            'create an',
+            'make a',
+            'make an',
+            'build a',
+            'build an',
+            'design a',
+            'design an',
+            'show me a',
+            'show me an',
+            'give me a',
+            'give me an',
+            'provide a',
+            'provide an',
+        ];
+        
+        foreach ($creationPhrases as $phrase) {
+            if (str_contains($message, $phrase)) {
+                Log::info('Content creation phrase detected, not an export', [
+                    'phrase' => $phrase
+                ]);
+                return null;
+            }
         }
-    }
-    
-    // ✅ If we have a strong indicator, it's definitely an export
-    if ($hasStrongIndicator) {
-        Log::info('Export request CONFIRMED via strong indicator', ['format' => $formatFound]);
-        return $formatFound;
-    }
-    
-    // ✅ NEW: Check for content references (the code, the poem, the table, etc.)
-    $contentReferences = [
-        'the code',
-        'the poem',
-        'the song',
-        'the table',
-        'the list',
-        'the data',
-        'the content',
-        'the response',
-        'the message',
-        'the output',
-        'this code',
-        'this poem',
-        'this song',
-        'this table',
-        'that code',
-        'that poem',
-        'that song',
-        'above',
-        'previous',
-    ];
-    
-    $hasContentReference = false;
-    foreach ($contentReferences as $reference) {
-        if (str_contains($message, $reference)) {
-            $hasContentReference = true;
-            Log::info('Content reference found', ['reference' => $reference]);
-            break;
+        
+        // ✅ NEW: Specific patterns that indicate CREATION, not EXPORT
+        // Example: "generate a pdf with a chart" = CREATE
+        // Example: "export as pdf" = EXPORT
+        $creationPatterns = [
+            '/generate\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
+            '/create\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
+            '/make\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
+            '/write\s+(a|an)\s+.*?(pdf|docx|xlsx|csv|pptx)/i',
+        ];
+        
+        foreach ($creationPatterns as $pattern) {
+            if (preg_match($pattern, $message)) {
+                Log::info('Creation pattern matched, not an export', [
+                    'pattern' => $pattern
+                ]);
+                return null;
+            }
         }
+        
+        // ✅ NEW: Strong export indicators
+        $strongExportIndicators = [
+            'export as',
+            'export to',
+            'export the',
+            'export this',
+            'export that',
+            'download as',
+            'download the',
+            'download this',
+            'download that',
+            'save as',
+            'save the',
+            'save this',
+            'save that',
+            'convert to',
+            'convert the',
+            'convert this',
+            'convert that',
+        ];
+        
+        $hasStrongIndicator = false;
+        foreach ($strongExportIndicators as $indicator) {
+            if (str_contains($message, $indicator)) {
+                $hasStrongIndicator = true;
+                Log::info('Strong export indicator found', ['indicator' => $indicator]);
+                break;
+            }
+        }
+        
+        // ✅ If we have a strong indicator, it's definitely an export
+        if ($hasStrongIndicator) {
+            Log::info('Export request CONFIRMED via strong indicator', ['format' => $formatFound]);
+            return $formatFound;
+        }
+        
+        // ✅ NEW: Check for content references (the code, the poem, the table, etc.)
+        $contentReferences = [
+            'the code',
+            'the poem',
+            'the song',
+            'the table',
+            'the list',
+            'the data',
+            'the content',
+            'the response',
+            'the message',
+            'the output',
+            'this code',
+            'this poem',
+            'this song',
+            'this table',
+            'that code',
+            'that poem',
+            'that song',
+            'above',
+            'previous',
+        ];
+        
+        $hasContentReference = false;
+        foreach ($contentReferences as $reference) {
+            if (str_contains($message, $reference)) {
+                $hasContentReference = true;
+                Log::info('Content reference found', ['reference' => $reference]);
+                break;
+            }
+        }
+        
+        // ✅ If we have an export word + content reference + format, it's an export
+        if ($hasExportWord && $hasContentReference && $formatFound) {
+            Log::info('Export request CONFIRMED via content reference', [
+                'export_word' => true,
+                'content_reference' => true,
+                'format' => $formatFound
+            ]);
+            return $formatFound;
+        }
+        
+        // ✅ Fallback: If we have export word + format but no clear creation intent, assume export
+        if ($hasExportWord && $formatFound) {
+            Log::info('Export request CONFIRMED via fallback logic', ['format' => $formatFound]);
+            return $formatFound;
+        }
+        
+        Log::info('No export intent detected, returning null');
+        return null;
     }
-    
-    // ✅ If we have an export word + content reference + format, it's an export
-    if ($hasExportWord && $hasContentReference && $formatFound) {
-        Log::info('Export request CONFIRMED via content reference', [
-            'export_word' => true,
-            'content_reference' => true,
-            'format' => $formatFound
-        ]);
-        return $formatFound;
-    }
-    
-    // ✅ Fallback: If we have export word + format but no clear creation intent, assume export
-    if ($hasExportWord && $formatFound) {
-        Log::info('Export request CONFIRMED via fallback logic', ['format' => $formatFound]);
-        return $formatFound;
-    }
-    
-    Log::info('No export intent detected, returning null');
-    return null;
-}
 
-/**
- * Handle file export request - Generate separate files for each model
- */
-private function handleFileExportRequest($format, $conversationId, $selectedModels, $exportMessage = '')
-{
-     try {
-        Log::info('File export requested', [
-            'format' => $format, 
-            'conversation_id' => $conversationId,
-            'selectedModels' => $selectedModels,
-            'export_message' => $exportMessage
-        ]);
-        
-        // Get conversation and messages
-        $conversation = MultiCompareConversation::with('messages')->findOrFail($conversationId);
-        
-        // ✅ NEW: Detect what content to export
-        $contentReference = $this->detectExportContentReference($exportMessage);
-        
-        Log::info('Export content reference', $contentReference);
-        
-        // ✅ NEW: Find the right message to export
-        $targetMessage = $this->findMessageToExport($conversation, $contentReference);
-        
-        if (!$targetMessage) {
-            return [
-                'success' => false,
-                'error' => 'No content found to export'
-            ];
-        }
-        
-        Log::info('Target message selected for export', [
-            'message_id' => $targetMessage->id,
-            'created_at' => $targetMessage->created_at
-        ]);
-        
-        // Extract data from the selected message
-        if (!$targetMessage->all_responses) {
-            return [
-                'success' => false,
-                'error' => 'No content found in the selected message'
-            ];
-        }
-        
-        $allResponses = $targetMessage->all_responses;
-        
-        // ✅ Log what's available for debugging
-        Log::info('Available responses in message', [
-            'response_keys' => array_keys($allResponses),
-            'count' => count($allResponses)
-        ]);
-        
-        $exportResults = []; // ✅ Store results for each model
-        
-        // ✅ SPECIAL HANDLING FOR SMART_ALL MODE
-        if (in_array('smart_all_auto', $selectedModels)) {
-            Log::info('Smart All mode detected, exporting first available response');
+    /**
+     * Handle file export request - Generate separate files for each model
+     */
+    private function handleFileExportRequest($format, $conversationId, $selectedModels, $exportMessage = '')
+    {
+        try {
+            Log::info('File export requested', [
+                'format' => $format, 
+                'conversation_id' => $conversationId,
+                'selectedModels' => $selectedModels,
+                'export_message' => $exportMessage
+            ]);
             
-            // Remove 'files' key if it exists
-            unset($allResponses['files']);
+            // Get conversation and messages
+            $conversation = MultiCompareConversation::with('messages')->findOrFail($conversationId);
             
-            // Get the first actual model response (not 'export' or 'files')
-            $actualResponses = array_filter($allResponses, function($key) {
-                return $key !== 'export' && $key !== 'files';
-            }, ARRAY_FILTER_USE_KEY);
+            // ✅ NEW: Detect what content to export
+            $contentReference = $this->detectExportContentReference($exportMessage);
             
-            if (empty($actualResponses)) {
+            Log::info('Export content reference', $contentReference);
+            
+            // ✅ NEW: Find the right message to export
+            $targetMessage = $this->findMessageToExport($conversation, $contentReference);
+            
+            if (!$targetMessage) {
                 return [
                     'success' => false,
-                    'error' => 'No model responses found to export'
+                    'error' => 'No content found to export'
                 ];
             }
             
-            // Get the first response
-            $firstModelId = array_key_first($actualResponses);
-            $modelContent = $actualResponses[$firstModelId];
-            
-            Log::info('Exporting content from model', [
-                'model' => $firstModelId,
-                'content_length' => strlen($modelContent)
+            Log::info('Target message selected for export', [
+                'message_id' => $targetMessage->id,
+                'created_at' => $targetMessage->created_at
             ]);
             
-            // Process this single response
-            $result = $this->processSingleExport($format, $modelContent, $conversation->title, 'smart_all_auto', $firstModelId);
-            
-            if ($result['success']) {
-                $exportResults['smart_all_auto'] = $result;
+            // Extract data from the selected message
+            if (!$targetMessage->all_responses) {
+                return [
+                    'success' => false,
+                    'error' => 'No content found in the selected message'
+                ];
             }
             
-        } else {
-            // ✅ IMPROVED: Generate separate file for EACH model with better matching
-            foreach ($selectedModels as $requestedModelId) {
-                $modelContent = null;
-                $actualModelUsed = null;
+            $allResponses = $targetMessage->all_responses;
+            
+            // ✅ Log what's available for debugging
+            Log::info('Available responses in message', [
+                'response_keys' => array_keys($allResponses),
+                'count' => count($allResponses)
+            ]);
+            
+            $exportResults = []; // ✅ Store results for each model
+            
+            // ✅ SPECIAL HANDLING FOR SMART_ALL MODE
+            if (in_array('smart_all_auto', $selectedModels)) {
+                Log::info('Smart All mode detected, exporting first available response');
                 
-                Log::info('Looking for content for model', ['requested' => $requestedModelId]);
+                // Remove 'files' key if it exists
+                unset($allResponses['files']);
                 
-                // Strategy 1: Direct match
-                if (isset($allResponses[$requestedModelId])) {
-                    $modelContent = $allResponses[$requestedModelId];
-                    $actualModelUsed = $requestedModelId;
-                    Log::info('✅ Strategy 1: Direct match found');
+                // Get the first actual model response (not 'export' or 'files')
+                $actualResponses = array_filter($allResponses, function($key) {
+                    return $key !== 'export' && $key !== 'files';
+                }, ARRAY_FILTER_USE_KEY);
+                
+                if (empty($actualResponses)) {
+                    return [
+                        'success' => false,
+                        'error' => 'No model responses found to export'
+                    ];
                 }
                 
-                // Strategy 2: Find by provider (for both Fixed and Smart Same modes)
-                if (!$modelContent) {
-                    // Get provider from the requested model
-                    $requestedModelSettings = \App\Models\AISettings::where('openaimodel', $requestedModelId)->first();
+                // Get the first response
+                $firstModelId = array_key_first($actualResponses);
+                $modelContent = $actualResponses[$firstModelId];
+                
+                Log::info('Exporting content from model', [
+                    'model' => $firstModelId,
+                    'content_length' => strlen($modelContent)
+                ]);
+                
+                // Process this single response
+                $result = $this->processSingleExport($format, $modelContent, $conversation->title, 'smart_all_auto', $firstModelId);
+                
+                if ($result['success']) {
+                    $exportResults['smart_all_auto'] = $result;
+                }
+                
+            } else {
+                // ✅ IMPROVED: Generate separate file for EACH model with better matching
+                foreach ($selectedModels as $requestedModelId) {
+                    $modelContent = null;
+                    $actualModelUsed = null;
                     
-                    if ($requestedModelSettings) {
-                        $requestedProvider = $requestedModelSettings->provider;
-                        Log::info('Strategy 2: Searching by provider', ['provider' => $requestedProvider]);
+                    Log::info('Looking for content for model', ['requested' => $requestedModelId]);
+                    
+                    // Strategy 1: Direct match
+                    if (isset($allResponses[$requestedModelId])) {
+                        $modelContent = $allResponses[$requestedModelId];
+                        $actualModelUsed = $requestedModelId;
+                        Log::info('✅ Strategy 1: Direct match found');
+                    }
+                    
+                    // Strategy 2: Find by provider (for both Fixed and Smart Same modes)
+                    if (!$modelContent) {
+                        // Get provider from the requested model
+                        $requestedModelSettings = \App\Models\AISettings::where('openaimodel', $requestedModelId)->first();
                         
-                        // Look through all responses for a model from the same provider
+                        if ($requestedModelSettings) {
+                            $requestedProvider = $requestedModelSettings->provider;
+                            Log::info('Strategy 2: Searching by provider', ['provider' => $requestedProvider]);
+                            
+                            // Look through all responses for a model from the same provider
+                            foreach ($allResponses as $responseModelId => $response) {
+                                if ($responseModelId === 'files' || $responseModelId === 'export') {
+                                    continue;
+                                }
+                                
+                                $responseModelSettings = \App\Models\AISettings::where('openaimodel', $responseModelId)->first();
+                                
+                                if ($responseModelSettings && $responseModelSettings->provider === $requestedProvider) {
+                                    $modelContent = $response;
+                                    $actualModelUsed = $responseModelId;
+                                    Log::info('✅ Strategy 2: Found by provider match', [
+                                        'requested' => $requestedModelId,
+                                        'actual' => $responseModelId
+                                    ]);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Strategy 3: For Smart Same mode with _smart_panel suffix
+                    if (!$modelContent && str_contains($requestedModelId, '_smart_panel')) {
+                        $provider = str_replace('_smart_panel', '', $requestedModelId);
+                        Log::info('Strategy 3: Smart panel mode', ['provider' => $provider]);
+                        
                         foreach ($allResponses as $responseModelId => $response) {
                             if ($responseModelId === 'files' || $responseModelId === 'export') {
                                 continue;
@@ -7155,1310 +4668,1278 @@ private function handleFileExportRequest($format, $conversationId, $selectedMode
                             
                             $responseModelSettings = \App\Models\AISettings::where('openaimodel', $responseModelId)->first();
                             
-                            if ($responseModelSettings && $responseModelSettings->provider === $requestedProvider) {
+                            if ($responseModelSettings && $responseModelSettings->provider === $provider) {
                                 $modelContent = $response;
                                 $actualModelUsed = $responseModelId;
-                                Log::info('✅ Strategy 2: Found by provider match', [
-                                    'requested' => $requestedModelId,
+                                Log::info('✅ Strategy 3: Found via smart panel', [
+                                    'panel' => $requestedModelId,
                                     'actual' => $responseModelId
                                 ]);
                                 break;
                             }
                         }
                     }
-                }
-                
-                // Strategy 3: For Smart Same mode with _smart_panel suffix
-                if (!$modelContent && str_contains($requestedModelId, '_smart_panel')) {
-                    $provider = str_replace('_smart_panel', '', $requestedModelId);
-                    Log::info('Strategy 3: Smart panel mode', ['provider' => $provider]);
                     
-                    foreach ($allResponses as $responseModelId => $response) {
-                        if ($responseModelId === 'files' || $responseModelId === 'export') {
-                            continue;
-                        }
-                        
-                        $responseModelSettings = \App\Models\AISettings::where('openaimodel', $responseModelId)->first();
-                        
-                        if ($responseModelSettings && $responseModelSettings->provider === $provider) {
-                            $modelContent = $response;
-                            $actualModelUsed = $responseModelId;
-                            Log::info('✅ Strategy 3: Found via smart panel', [
-                                'panel' => $requestedModelId,
-                                'actual' => $responseModelId
-                            ]);
-                            break;
-                        }
+                    if (!$modelContent) {
+                        Log::warning("❌ No content found for model after all strategies", [
+                            'requested_model' => $requestedModelId,
+                            'available_models' => array_keys($allResponses)
+                        ]);
+                        continue;
+                    }
+                    
+                    Log::info('Processing export for model', [
+                        'requested_model' => $requestedModelId,
+                        'actual_model' => $actualModelUsed,
+                        'content_length' => strlen($modelContent)
+                    ]);
+                    
+                    // Process this model's export (use requested model ID for panel mapping)
+                    $result = $this->processSingleExport($format, $modelContent, $conversation->title, $requestedModelId, $actualModelUsed);
+                    
+                    if ($result['success']) {
+                        $exportResults[$requestedModelId] = $result;
                     }
                 }
-                
-                if (!$modelContent) {
-                    Log::warning("❌ No content found for model after all strategies", [
-                        'requested_model' => $requestedModelId,
-                        'available_models' => array_keys($allResponses)
-                    ]);
-                    continue;
-                }
-                
-                Log::info('Processing export for model', [
-                    'requested_model' => $requestedModelId,
-                    'actual_model' => $actualModelUsed,
-                    'content_length' => strlen($modelContent)
-                ]);
-                
-                // Process this model's export (use requested model ID for panel mapping)
-                $result = $this->processSingleExport($format, $modelContent, $conversation->title, $requestedModelId, $actualModelUsed);
-                
-                if ($result['success']) {
-                    $exportResults[$requestedModelId] = $result;
-                }
             }
-        }
-        
-        if (empty($exportResults)) {
-            return [
-                'success' => false,
-                'error' => 'No content found to export for selected models'
-            ];
-        }
-        
-        return [
-            'success' => true,
-            'results' => $exportResults
-        ];
-        
-    } catch (\Exception $e) {
-        Log::error('File export error: ' . $e->getMessage(), [
-            'trace' => $e->getTraceAsString()
-        ]);
-        
-        return [
-            'success' => false,
-            'error' => 'Failed to generate file: ' . $e->getMessage()
-        ];
-    }
-}
-
-/**
- * Process a single model's export
- */
-/**
- * Process a single model's export
- */
-private function processSingleExport($format, $modelContent, $conversationTitle, $panelModelId, $actualModelId)
-{
-    try {
-        // ✅ Add model identifier to content
-        $contentWithHeader = "# Generated by: " . $actualModelId . "\n\n" . $modelContent;
-        
-        // Try to extract table data first
-        $extractedData = $this->extractTableDataFromContent($contentWithHeader);
-        
-        $headers = null;
-        $data = null;
-        
-        if ($extractedData) {
-            // We have table data
-            $headers = $extractedData['headers'];
-            $data = $extractedData['data'];
-        }
-        
-        // Generate file for this model
-        $tempFile = null;
-        $cleanModelId = str_replace(['_smart_panel', '/', ':', '.'], ['', '_', '_', '_'], $panelModelId);
-        $fileName = 'chattermate_' . $cleanModelId . '_export_' . date('Y-m-d_His');
-        
-        switch ($format) {
-            case 'csv':
-                if (!$extractedData) {
-                    return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
-                }
-                $tempFile = $this->generateCSVFile($data, $headers);
-                $fileName .= '.csv';
-                break;
-                
-            case 'xlsx':
-                if (!$extractedData) {
-                    return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
-                }
-                $tempFile = $this->generateExcelFile($data, $headers);
-                $fileName .= '.xlsx';
-                break;
-                
-            case 'pdf':
-                // ✅ IMPROVED: Pass raw content to PDF generator for proper formatting
-                $tempFile = $this->generatePDFFile($data, $headers, $contentWithHeader);
-                $fileName .= '.pdf';
-                break;
-                
-            case 'docx':
-                if (!$extractedData) {
-                    return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
-                }
-                $tempFile = $this->generateDOCXFile($data, $headers);
-                $fileName .= '.docx';
-                break;
-                
-            case 'txt':
-                if ($extractedData) {
-                    $tempFile = $this->generateTXTFileFromTable($data, $headers);
-                } else {
-                    return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
-                }
-                $fileName .= '.txt';
-                break;
-                
-            case 'pptx':
-                if ($extractedData) {
-                    $tempFile = $this->generatePPTXFileFromTable($data, $headers, $conversationTitle . ' - ' . $actualModelId);
-                } else {
-                    $tempFile = $this->generatePPTXFileFromText($contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
-                }
-                $fileName .= '.pptx';
-                break;
-                
-            default:
+            
+            if (empty($exportResults)) {
                 return [
                     'success' => false,
-                    'error' => 'Unsupported format: ' . $format
+                    'error' => 'No content found to export for selected models'
                 ];
-        }
-        
-        if (!$tempFile || !file_exists($tempFile)) {
-            Log::error("Failed to generate file for model: {$panelModelId}");
-            return [
-                'success' => false,
-                'error' => 'Failed to generate file'
-            ];
-        }
-        
-        // Upload to Azure
-        $downloadUrl = $this->uploadFileToAzure($tempFile, $fileName, $format);
-        
-        // Clean up temp file
-        unlink($tempFile);
-        
-        // ✅ Return result for this model
-        return [
-            'success' => true,
-            'download_url' => $downloadUrl,
-            'file_name' => $fileName,
-            'file_format' => strtoupper($format),
-            'rows' => isset($data) ? count($data) : 0,
-            'columns' => isset($headers) ? count($headers) : 0,
-            'model' => $panelModelId,
-            'actual_model' => $actualModelId
-        ];
-        
-    } catch (\Exception $e) {
-        Log::error('Single export error: ' . $e->getMessage(), [
-            'panel_model' => $panelModelId,
-            'actual_model' => $actualModelId
-        ]);
-        
-        return [
-            'success' => false,
-            'error' => 'Failed to process export: ' . $e->getMessage()
-        ];
-    }
-}
-
-/**
- * Extract table data from content
- */
-private function extractTableDataFromContent($content)
-{
-    // Try markdown tables first
-    if (preg_match('/\|(.+)\|/', $content)) {
-        $lines = explode("\n", $content);
-        $headers = [];
-        $tableData = [];
-        $inTable = false;
-        
-        foreach ($lines as $line) {
-            $line = trim($line);
-            if (empty($line)) continue;
+            }
             
-            // Check if line is a table row
-            if (preg_match('/^\|(.+)\|$/', $line)) {
-                // Remove outer pipes and split
-                $cells = array_map('trim', explode('|', trim($line, '|')));
-                
-                // Skip separator lines
-                if (preg_match('/^[\s\-:|\s]+$/', $line)) {
-                    $inTable = true;
-                    continue;
-                }
-                
-                if (empty($headers)) {
-                    // First row is headers
-                    $headers = $cells;
-                } elseif ($inTable) {
-                    // Data row
-                    $tableData[] = array_combine($headers, array_slice($cells, 0, count($headers)));
-                }
-            }
-        }
-        
-        if (!empty($headers) && !empty($tableData)) {
-            return ['headers' => $headers, 'data' => $tableData];
-        }
-    }
-    
-    // Try JSON arrays
-    if (preg_match('/```json\s*(\[[\s\S]*?\])\s*```/', $content, $matches)) {
-        try {
-            $jsonData = json_decode($matches[1], true);
-            if (is_array($jsonData) && !empty($jsonData) && is_array($jsonData[0])) {
-                $headers = array_keys($jsonData[0]);
-                return ['headers' => $headers, 'data' => $jsonData];
-            }
+            return [
+                'success' => true,
+                'results' => $exportResults
+            ];
+            
         } catch (\Exception $e) {
-            // Continue to next method
-        }
-    }
-    
-    return null;
-}
-
-/**
- * Export plain text content
- */
-private function exportPlainText($format, $content, $title)
-{
-    $fileName = 'chattermate_export_' . date('Y-m-d_His');
-    $parsedown = new Parsedown();
-    
-    try {
-        switch ($format) {
-            case 'pdf':
-                // Generate PDF from markdown
-                $html = $parsedown->text($content);
-                $pdf = new TCPDF();
-                $pdf->AddPage();
-                $pdf->SetFont('helvetica', '', 11);
-                $pdf->writeHTML($html, true, false, true, false, '');
-                
-                $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.pdf';
-                $pdf->Output($tempFile, 'F');
-                $fileName .= '.pdf';
-                break;
-                
-            case 'docx':
-                // Generate DOCX from markdown
-                $phpWord = new PhpWord();
-                $section = $phpWord->addSection();
-                
-                // Add title
-                $section->addTitle($title, 1);
-                $section->addTextBreak(1);
-                
-                // Add content (simple paragraph)
-                $section->addText($content);
-                
-                $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.docx';
-                $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
-                $objWriter->save($tempFile);
-                $fileName .= '.docx';
-                break;
-                
-            case 'xlsx':
-                // Generate Excel with content
-                $spreadsheet = new Spreadsheet();
-                $sheet = $spreadsheet->getActiveSheet();
-                $sheet->setCellValue('A1', 'ChatterMate Export');
-                $sheet->setCellValue('A2', $title);
-                $sheet->setCellValue('A4', $content);
-                
-                $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.xlsx';
-                $writer = new Xlsx($spreadsheet);
-                $writer->save($tempFile);
-                $fileName .= '.xlsx';
-                break;
-                
-            case 'txt':
-                // Simple text file
-                $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.txt';
-                file_put_contents($tempFile, "ChatterMate Export\n" . $title . "\n\n" . $content);
-                $fileName .= '.txt';
-                break;
-                
-            case 'pptx':
-                // Generate PPTX from markdown content
-                // Since this is plain text content (not table), create a slide with text box
-                $tempFile = $this->generatePPTXFileFromText($content, $title);
-                $fileName .= '.pptx';
-                break;
-                
-            default:
-                return [
-                    'success' => false,
-                    'error' => 'Unsupported format for plain text export'
-                ];
-        }
-        
-        // Upload to Azure
-        $downloadUrl = $this->uploadFileToAzure($tempFile, $fileName, $format);
-        unlink($tempFile);
-        
-        return [
-            'success' => true,
-            'download_url' => $downloadUrl,
-            'file_name' => $fileName,
-            'file_format' => strtoupper($format),
-            'rows' => 1,
-            'columns' => 1
-        ];
-        
-    } catch (\Exception $e) {
-        Log::error('Plain text export error: ' . $e->getMessage());
-        return [
-            'success' => false,
-            'error' => 'Failed to generate file: ' . $e->getMessage()
-        ];
-    }
-}
-
-/**
- * Generate CSV file from table data
- */
-private function generateCSVFile($data, $headers)
-{
-    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.csv';
-    
-    $csv = Writer::createFromPath($tempFile, 'w+');
-    $csv->setDelimiter(',');
-    $csv->setEnclosure('"');
-    $csv->setOutputBOM(Writer::BOM_UTF8);
-    
-    // Write title row
-    $csv->insertOne(['ChatterMate AI Export']);
-    $csv->insertOne(['Generated: ' . date('Y-m-d H:i:s')]);
-    $csv->insertOne([]); // Empty row
-    
-    // Write headers
-    $csv->insertOne($headers);
-    
-    // Write data rows
-    foreach ($data as $row) {
-        if (is_array($row)) {
-            if (!empty($headers) && array_keys($row) !== range(0, count($row) - 1)) {
-                $csvRow = [];
-                foreach ($headers as $header) {
-                    $csvRow[] = $row[$header] ?? '';
-                }
-                $csv->insertOne($csvRow);
-            } else {
-                $csv->insertOne(array_values($row));
-            }
-        }
-    }
-    
-    return $tempFile;
-}
-
-/**
- * Generate Excel file from table data
- */
-private function generateExcelFile($data, $headers)
-{
-    $spreadsheet = new Spreadsheet();
-    $sheet = $spreadsheet->getActiveSheet();
-    $sheet->setTitle('ChatterMate Export');
-    
-    // Title section (rows 1-3)
-    $sheet->setCellValue('A1', 'ChatterMate AI Export');
-    $sheet->mergeCells('A1:' . chr(64 + count($headers)) . '1');
-    $sheet->getStyle('A1')->applyFromArray([
-        'font' => [
-            'bold' => true,
-            'size' => 16,
-            'color' => ['rgb' => '4F46E5'],
-        ],
-        'alignment' => [
-            'horizontal' => Alignment::HORIZONTAL_CENTER,
-        ],
-    ]);
-    
-    $sheet->setCellValue('A2', 'Generated: ' . date('F j, Y \a\t g:i A'));
-    $sheet->mergeCells('A2:' . chr(64 + count($headers)) . '2');
-    $sheet->getStyle('A2')->applyFromArray([
-        'font' => [
-            'size' => 10,
-            'color' => ['rgb' => '6B7280'],
-        ],
-        'alignment' => [
-            'horizontal' => Alignment::HORIZONTAL_CENTER,
-        ],
-    ]);
-    
-    $sheet->setCellValue('A3', 'Total Rows: ' . count($data));
-    $sheet->mergeCells('A3:' . chr(64 + count($headers)) . '3');
-    $sheet->getStyle('A3')->applyFromArray([
-        'font' => [
-            'size' => 10,
-            'italic' => true,
-            'color' => ['rgb' => '6B7280'],
-        ],
-        'alignment' => [
-            'horizontal' => Alignment::HORIZONTAL_CENTER,
-        ],
-    ]);
-    
-    // Header row (row 5)
-    $headerStyle = [
-        'font' => [
-            'bold' => true,
-            'color' => ['rgb' => 'FFFFFF'],
-            'size' => 12,
-        ],
-        'fill' => [
-            'fillType' => Fill::FILL_SOLID,
-            'startColor' => ['rgb' => '4F46E5'],
-        ],
-        'alignment' => [
-            'horizontal' => Alignment::HORIZONTAL_CENTER,
-            'vertical' => Alignment::VERTICAL_CENTER,
-        ],
-        'borders' => [
-            'allBorders' => [
-                'borderStyle' => Border::BORDER_THIN,
-                'color' => ['rgb' => '000000'],
-            ],
-        ],
-    ];
-    
-    $col = 'A';
-    foreach ($headers as $header) {
-        $sheet->setCellValue($col . '5', $header);
-        $sheet->getStyle($col . '5')->applyFromArray($headerStyle);
-        $sheet->getColumnDimension($col)->setAutoSize(true);
-        $col++;
-    }
-    
-    // Data rows (starting from row 6)
-    $row = 6;
-    foreach ($data as $dataRow) {
-        $col = 'A';
-        foreach ($headers as $header) {
-            $value = is_array($dataRow) ? ($dataRow[$header] ?? '') : $dataRow;
-            $sheet->setCellValue($col . $row, $value);
-            
-            // Apply data cell styling
-            $sheet->getStyle($col . $row)->applyFromArray([
-                'borders' => [
-                    'allBorders' => [
-                        'borderStyle' => Border::BORDER_THIN,
-                        'color' => ['rgb' => 'E5E7EB'],
-                    ],
-                ],
-                'alignment' => [
-                    'vertical' => Alignment::VERTICAL_TOP,
-                    'wrapText' => true,
-                ],
+            Log::error('File export error: ' . $e->getMessage(), [
+                'trace' => $e->getTraceAsString()
             ]);
             
+            return [
+                'success' => false,
+                'error' => 'Failed to generate file: ' . $e->getMessage()
+            ];
+        }
+    }
+
+    /**
+     * Process a single model's export
+     */
+    private function processSingleExport($format, $modelContent, $conversationTitle, $panelModelId, $actualModelId)
+    {
+        try {
+            // ✅ Add model identifier to content
+            $contentWithHeader = "# Generated by: " . $actualModelId . "\n\n" . $modelContent;
+            
+            // Try to extract table data first
+            $extractedData = $this->extractTableDataFromContent($contentWithHeader);
+            
+            $headers = null;
+            $data = null;
+            
+            if ($extractedData) {
+                // We have table data
+                $headers = $extractedData['headers'];
+                $data = $extractedData['data'];
+            }
+            
+            // Generate file for this model
+            $tempFile = null;
+            $cleanModelId = str_replace(['_smart_panel', '/', ':', '.'], ['', '_', '_', '_'], $panelModelId);
+            $fileName = 'chattermate_' . $cleanModelId . '_export_' . date('Y-m-d_His');
+            
+            switch ($format) {
+                case 'csv':
+                    if (!$extractedData) {
+                        return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                    }
+                    $tempFile = $this->generateCSVFile($data, $headers);
+                    $fileName .= '.csv';
+                    break;
+                    
+                case 'xlsx':
+                    if (!$extractedData) {
+                        return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                    }
+                    $tempFile = $this->generateExcelFile($data, $headers);
+                    $fileName .= '.xlsx';
+                    break;
+                    
+                case 'pdf':
+                    // ✅ IMPROVED: Pass raw content to PDF generator for proper formatting
+                    $tempFile = $this->generatePDFFile($data, $headers, $contentWithHeader);
+                    $fileName .= '.pdf';
+                    break;
+                    
+                case 'docx':
+                    if (!$extractedData) {
+                        return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                    }
+                    $tempFile = $this->generateDOCXFile($data, $headers);
+                    $fileName .= '.docx';
+                    break;
+                    
+                case 'txt':
+                    if ($extractedData) {
+                        $tempFile = $this->generateTXTFileFromTable($data, $headers);
+                    } else {
+                        return $this->exportPlainText($format, $contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                    }
+                    $fileName .= '.txt';
+                    break;
+                    
+                case 'pptx':
+                    if ($extractedData) {
+                        $tempFile = $this->generatePPTXFileFromTable($data, $headers, $conversationTitle . ' - ' . $actualModelId);
+                    } else {
+                        $tempFile = $this->generatePPTXFileFromText($contentWithHeader, $conversationTitle . ' - ' . $actualModelId);
+                    }
+                    $fileName .= '.pptx';
+                    break;
+                    
+                default:
+                    return [
+                        'success' => false,
+                        'error' => 'Unsupported format: ' . $format
+                    ];
+            }
+            
+            if (!$tempFile || !file_exists($tempFile)) {
+                Log::error("Failed to generate file for model: {$panelModelId}");
+                return [
+                    'success' => false,
+                    'error' => 'Failed to generate file'
+                ];
+            }
+            
+            // Upload to Azure
+            $downloadUrl = $this->uploadFileToAzure($tempFile, $fileName, $format);
+            
+            // Clean up temp file
+            unlink($tempFile);
+            
+            // ✅ Return result for this model
+            return [
+                'success' => true,
+                'download_url' => $downloadUrl,
+                'file_name' => $fileName,
+                'file_format' => strtoupper($format),
+                'rows' => isset($data) ? count($data) : 0,
+                'columns' => isset($headers) ? count($headers) : 0,
+                'model' => $panelModelId,
+                'actual_model' => $actualModelId
+            ];
+            
+        } catch (\Exception $e) {
+            Log::error('Single export error: ' . $e->getMessage(), [
+                'panel_model' => $panelModelId,
+                'actual_model' => $actualModelId
+            ]);
+            
+            return [
+                'success' => false,
+                'error' => 'Failed to process export: ' . $e->getMessage()
+            ];
+        }
+    }
+
+    /**
+     * Extract table data from content
+     */
+    private function extractTableDataFromContent($content)
+    {
+        // Try markdown tables first
+        if (preg_match('/\|(.+)\|/', $content)) {
+            $lines = explode("\n", $content);
+            $headers = [];
+            $tableData = [];
+            $inTable = false;
+            
+            foreach ($lines as $line) {
+                $line = trim($line);
+                if (empty($line)) continue;
+                
+                // Check if line is a table row
+                if (preg_match('/^\|(.+)\|$/', $line)) {
+                    // Remove outer pipes and split
+                    $cells = array_map('trim', explode('|', trim($line, '|')));
+                    
+                    // Skip separator lines
+                    if (preg_match('/^[\s\-:|\s]+$/', $line)) {
+                        $inTable = true;
+                        continue;
+                    }
+                    
+                    if (empty($headers)) {
+                        // First row is headers
+                        $headers = $cells;
+                    } elseif ($inTable) {
+                        // Data row
+                        $tableData[] = array_combine($headers, array_slice($cells, 0, count($headers)));
+                    }
+                }
+            }
+            
+            if (!empty($headers) && !empty($tableData)) {
+                return ['headers' => $headers, 'data' => $tableData];
+            }
+        }
+        
+        // Try JSON arrays
+        if (preg_match('/```json\s*(\[[\s\S]*?\])\s*```/', $content, $matches)) {
+            try {
+                $jsonData = json_decode($matches[1], true);
+                if (is_array($jsonData) && !empty($jsonData) && is_array($jsonData[0])) {
+                    $headers = array_keys($jsonData[0]);
+                    return ['headers' => $headers, 'data' => $jsonData];
+                }
+            } catch (\Exception $e) {
+                // Continue to next method
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Export plain text content
+     */
+    private function exportPlainText($format, $content, $title)
+    {
+        $fileName = 'chattermate_export_' . date('Y-m-d_His');
+        $parsedown = new Parsedown();
+        
+        try {
+            switch ($format) {
+                case 'pdf':
+                    // Generate PDF from markdown
+                    $html = $parsedown->text($content);
+                    $pdf = new TCPDF();
+                    $pdf->AddPage();
+                    $pdf->SetFont('helvetica', '', 11);
+                    $pdf->writeHTML($html, true, false, true, false, '');
+                    
+                    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.pdf';
+                    $pdf->Output($tempFile, 'F');
+                    $fileName .= '.pdf';
+                    break;
+                    
+                case 'docx':
+                    // Generate DOCX from markdown
+                    $phpWord = new PhpWord();
+                    $section = $phpWord->addSection();
+                    
+                    // Add title
+                    $section->addTitle($title, 1);
+                    $section->addTextBreak(1);
+                    
+                    // Add content (simple paragraph)
+                    $section->addText($content);
+                    
+                    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.docx';
+                    $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
+                    $objWriter->save($tempFile);
+                    $fileName .= '.docx';
+                    break;
+                    
+                case 'xlsx':
+                    // Generate Excel with content
+                    $spreadsheet = new Spreadsheet();
+                    $sheet = $spreadsheet->getActiveSheet();
+                    $sheet->setCellValue('A1', 'ChatterMate Export');
+                    $sheet->setCellValue('A2', $title);
+                    $sheet->setCellValue('A4', $content);
+                    
+                    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.xlsx';
+                    $writer = new Xlsx($spreadsheet);
+                    $writer->save($tempFile);
+                    $fileName .= '.xlsx';
+                    break;
+                    
+                case 'txt':
+                    // Simple text file
+                    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.txt';
+                    file_put_contents($tempFile, "ChatterMate Export\n" . $title . "\n\n" . $content);
+                    $fileName .= '.txt';
+                    break;
+                    
+                case 'pptx':
+                    // Generate PPTX from markdown content
+                    // Since this is plain text content (not table), create a slide with text box
+                    $tempFile = $this->generatePPTXFileFromText($content, $title);
+                    $fileName .= '.pptx';
+                    break;
+                    
+                default:
+                    return [
+                        'success' => false,
+                        'error' => 'Unsupported format for plain text export'
+                    ];
+            }
+            
+            // Upload to Azure
+            $downloadUrl = $this->uploadFileToAzure($tempFile, $fileName, $format);
+            unlink($tempFile);
+            
+            return [
+                'success' => true,
+                'download_url' => $downloadUrl,
+                'file_name' => $fileName,
+                'file_format' => strtoupper($format),
+                'rows' => 1,
+                'columns' => 1
+            ];
+            
+        } catch (\Exception $e) {
+            Log::error('Plain text export error: ' . $e->getMessage());
+            return [
+                'success' => false,
+                'error' => 'Failed to generate file: ' . $e->getMessage()
+            ];
+        }
+    }
+
+    /**
+     * Generate CSV file from table data
+     */
+    private function generateCSVFile($data, $headers)
+    {
+        $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.csv';
+        
+        $csv = Writer::createFromPath($tempFile, 'w+');
+        $csv->setDelimiter(',');
+        $csv->setEnclosure('"');
+        $csv->setOutputBOM(Writer::BOM_UTF8);
+        
+        // Write title row
+        $csv->insertOne(['ChatterMate AI Export']);
+        $csv->insertOne(['Generated: ' . date('Y-m-d H:i:s')]);
+        $csv->insertOne([]); // Empty row
+        
+        // Write headers
+        $csv->insertOne($headers);
+        
+        // Write data rows
+        foreach ($data as $row) {
+            if (is_array($row)) {
+                if (!empty($headers) && array_keys($row) !== range(0, count($row) - 1)) {
+                    $csvRow = [];
+                    foreach ($headers as $header) {
+                        $csvRow[] = $row[$header] ?? '';
+                    }
+                    $csv->insertOne($csvRow);
+                } else {
+                    $csv->insertOne(array_values($row));
+                }
+            }
+        }
+        
+        return $tempFile;
+    }
+
+    /**
+     * Generate Excel file from table data
+     */
+    private function generateExcelFile($data, $headers)
+    {
+        $spreadsheet = new Spreadsheet();
+        $sheet = $spreadsheet->getActiveSheet();
+        $sheet->setTitle('ChatterMate Export');
+        
+        // Title section (rows 1-3)
+        $sheet->setCellValue('A1', 'ChatterMate AI Export');
+        $sheet->mergeCells('A1:' . chr(64 + count($headers)) . '1');
+        $sheet->getStyle('A1')->applyFromArray([
+            'font' => [
+                'bold' => true,
+                'size' => 16,
+                'color' => ['rgb' => '4F46E5'],
+            ],
+            'alignment' => [
+                'horizontal' => Alignment::HORIZONTAL_CENTER,
+            ],
+        ]);
+        
+        $sheet->setCellValue('A2', 'Generated: ' . date('F j, Y \a\t g:i A'));
+        $sheet->mergeCells('A2:' . chr(64 + count($headers)) . '2');
+        $sheet->getStyle('A2')->applyFromArray([
+            'font' => [
+                'size' => 10,
+                'color' => ['rgb' => '6B7280'],
+            ],
+            'alignment' => [
+                'horizontal' => Alignment::HORIZONTAL_CENTER,
+            ],
+        ]);
+        
+        $sheet->setCellValue('A3', 'Total Rows: ' . count($data));
+        $sheet->mergeCells('A3:' . chr(64 + count($headers)) . '3');
+        $sheet->getStyle('A3')->applyFromArray([
+            'font' => [
+                'size' => 10,
+                'italic' => true,
+                'color' => ['rgb' => '6B7280'],
+            ],
+            'alignment' => [
+                'horizontal' => Alignment::HORIZONTAL_CENTER,
+            ],
+        ]);
+        
+        // Header row (row 5)
+        $headerStyle = [
+            'font' => [
+                'bold' => true,
+                'color' => ['rgb' => 'FFFFFF'],
+                'size' => 12,
+            ],
+            'fill' => [
+                'fillType' => Fill::FILL_SOLID,
+                'startColor' => ['rgb' => '4F46E5'],
+            ],
+            'alignment' => [
+                'horizontal' => Alignment::HORIZONTAL_CENTER,
+                'vertical' => Alignment::VERTICAL_CENTER,
+            ],
+            'borders' => [
+                'allBorders' => [
+                    'borderStyle' => Border::BORDER_THIN,
+                    'color' => ['rgb' => '000000'],
+                ],
+            ],
+        ];
+        
+        $col = 'A';
+        foreach ($headers as $header) {
+            $sheet->setCellValue($col . '5', $header);
+            $sheet->getStyle($col . '5')->applyFromArray($headerStyle);
+            $sheet->getColumnDimension($col)->setAutoSize(true);
             $col++;
         }
         
-        // Alternating row colors
-        if ($row % 2 == 0) {
-            $sheet->getStyle('A' . $row . ':' . chr(64 + count($headers)) . $row)
-                ->getFill()
-                ->setFillType(Fill::FILL_SOLID)
-                ->getStartColor()->setRGB('F9FAFB');
-        }
-        
-        $row++;
-    }
-    
-    // Freeze header row
-    $sheet->freezePane('A6');
-    
-    // Add footer
-    $sheet->getHeaderFooter()->setOddFooter('&L&B' . 'ChatterMate AI' . '&RPage &P of &N');
-    
-    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.xlsx';
-    $writer = new Xlsx($spreadsheet);
-    $writer->save($tempFile);
-    
-    return $tempFile;
-}
-
-/**
- * Generate TXT file from table data
- */
-private function generateTXTFileFromTable($data, $headers)
-{
-    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.txt';
-    $content = "ChatterMate Export - Table Data\n\n";
-    
-    // Add headers
-    $content .= implode(" | ", $headers) . "\n";
-    $content .= str_repeat("-", 50) . "\n";
-    
-    // Add data
-    foreach ($data as $row) {
-        $rowValues = [];
-        foreach ($headers as $header) {
-            $rowValues[] = $row[$header] ?? '';
-        }
-        $content .= implode(" | ", $rowValues) . "\n";
-    }
-    
-    file_put_contents($tempFile, $content);
-    return $tempFile;
-}
-
-/**
- * Generate PPTX file from Text
- * Uses PHPPresentation if available, otherwise fallback or error
- */
-private function generatePPTXFileFromText($content, $title)
-{
-    // Check if class exists (assuming phpoffice/phppresentation might not be installed)
-    if (!class_exists('\PhpOffice\PhpPresentation\PhpPresentation')) {
-        return $this->createBasicPPTX($content, $title);
-    }
-    
-    // If library exists:
-    $objPHPPowerPoint = new \PhpOffice\PhpPresentation\PhpPresentation();
-    $currentSlide = $objPHPPowerPoint->getActiveSlide();
-
-    // Create a shape (text)
-    $shape = $currentSlide->createRichTextShape()
-        ->setHeight(600)
-        ->setWidth(900)
-        ->setOffsetX(10)
-        ->setOffsetY(10);
-    $shape->getActiveParagraph()->getAlignment()->setHorizontal( \PhpOffice\PhpPresentation\Style\Alignment::HORIZONTAL_CENTER );
-    $textRun = $shape->createTextRun($title);
-    $textRun->getFont()->setBold(true)->setSize(28)->setColor( new \PhpOffice\PhpPresentation\Style\Color( 'FF000000' ) );
-
-    // Content
-    $shape2 = $currentSlide->createRichTextShape()
-        ->setHeight(600)
-        ->setWidth(900)
-        ->setOffsetX(10)
-        ->setOffsetY(100);
-    $shape2->createTextRun(substr($content, 0, 1000)); // Limit text per slide
-
-    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.pptx';
-    $oWriterPPTX = \PhpOffice\PhpPresentation\IOFactory::createWriter($objPHPPowerPoint, 'PowerPoint2007');
-    $oWriterPPTX->save($tempFile);
-    
-    return $tempFile;
-}
-
-/**
- * Generate PPTX file from Table
- */
-private function generatePPTXFileFromTable($data, $headers, $title)
-{
-     // Reuse text logic for now but format as table if library exists
-     $content = "Table Data:\n" . implode(" | ", $headers) . "\n...\n(See extracted data)";
-     return $this->generatePPTXFileFromText($content, $title);
-}
-
-
-/**
- * Minimal PPTX Generator (No Library Fallback)
- */
-private function createBasicPPTX($content, $title)
-{
-    // Minimal error message if library is missing, as manual PPTX creation is too complex for this scope
-    throw new \Exception("PPTX Export requires 'phpoffice/phppresentation'. Please install it via composer.");
-}
-
-/**
- * Generate PDF file from table data
- */
-/**
- * Generate PDF file from table data OR markdown content
- */
-private function generatePDFFile($data, $headers, $rawContent = null)
-{
-    $pdf = new TCPDF(PDF_PAGE_ORIENTATION, PDF_UNIT, PDF_PAGE_FORMAT, true, 'UTF-8', false);
-    
-    // Document information
-    $pdf->SetCreator('ChatterMate AI');
-    $pdf->SetAuthor('ChatterMate AI');
-    $pdf->SetTitle('ChatterMate Export - ' . date('Y-m-d'));
-    $pdf->SetSubject('Data Export');
-    $pdf->SetKeywords('ChatterMate, AI, Export, Data');
-    
-    // Custom header
-    $pdf->SetHeaderData('', 0, 'ChatterMate AI Export', 'Generated: ' . date('F j, Y \a\t g:i A'));
-    
-    // Header and footer fonts
-    $pdf->setHeaderFont([PDF_FONT_NAME_MAIN, '', 11]);
-    $pdf->setFooterFont([PDF_FONT_NAME_DATA, '', 8]);
-    
-    // Margins
-    $pdf->SetMargins(15, 27, 15);
-    $pdf->SetHeaderMargin(5);
-    $pdf->SetFooterMargin(10);
-    
-    // Auto page breaks
-    $pdf->SetAutoPageBreak(TRUE, 25);
-    
-    // Add page
-    $pdf->AddPage();
-    
-    // ✅ Enhanced CSS for better formatting
-    $styles = '
-    <style>
-        body {
-            font-family: helvetica;
-            font-size: 11px;
-            line-height: 1.6;
-            color: #333333;
-        }
-        h1 {
-            color: #4F46E5;
-            font-size: 24px;
-            font-weight: bold;
-            margin-top: 20px;
-            margin-bottom: 15px;
-            padding-bottom: 8px;
-            border-bottom: 3px solid #4F46E5;
-        }
-        h2 {
-            color: #6366F1;
-            font-size: 20px;
-            font-weight: bold;
-            margin-top: 18px;
-            margin-bottom: 12px;
-            padding-bottom: 5px;
-            border-bottom: 2px solid #E0E7FF;
-        }
-        h3 {
-            color: #818CF8;
-            font-size: 16px;
-            font-weight: bold;
-            margin-top: 15px;
-            margin-bottom: 10px;
-        }
-        h4, h5, h6 {
-            color: #A5B4FC;
-            font-size: 14px;
-            font-weight: bold;
-            margin-top: 12px;
-            margin-bottom: 8px;
-        }
-        p {
-            margin-top: 5px;
-            margin-bottom: 10px;
-            text-align: justify;
-            white-space: pre-wrap;
-        }
-        strong, b {
-            font-weight: bold;
-            color: #1F2937;
-        }
-        em, i {
-            font-style: italic;
-            color: #4B5563;
-        }
-        ul, ol {
-            margin-left: 20px;
-            margin-top: 8px;
-            margin-bottom: 12px;
-        }
-        li {
-            margin-bottom: 5px;
-            line-height: 1.5;
-        }
-        code {
-            background-color: #F3F4F6;
-            color: #DC2626;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-family: courier;
-            font-size: 10px;
-        }
-        pre {
-            background-color: #1F2937;
-            color: #F9FAFB;
-            padding: 15px;
-            border-radius: 8px;
-            margin: 15px 0;
-            overflow-x: auto;
-            font-family: courier;
-            font-size: 9px;
-            line-height: 1.4;
-            border-left: 4px solid #4F46E5;
-            white-space: pre-wrap;
-        }
-        pre code {
-            background-color: transparent;
-            color: #F9FAFB;
-            padding: 0;
-        }
-        blockquote {
-            border-left: 4px solid #4F46E5;
-            padding-left: 15px;
-            margin: 15px 0;
-            color: #6B7280;
-            font-style: italic;
-            background-color: #F9FAFB;
-            padding: 10px 15px;
-        }
-        table {
-            border-collapse: collapse;
-            width: 100%;
-            margin: 15px 0;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        }
-        th {
-            background-color: #4F46E5;
-            color: #FFFFFF;
-            font-weight: bold;
-            padding: 12px 10px;
-            text-align: left;
-            border: 1px solid #3730A3;
-            font-size: 11px;
-        }
-        td {
-            padding: 10px;
-            border: 1px solid #E5E7EB;
-            font-size: 10px;
-            vertical-align: top;
-        }
-        tr:nth-child(even) {
-            background-color: #F9FAFB;
-        }
-        tr:nth-child(odd) {
-            background-color: #FFFFFF;
-        }
-        tr:hover {
-            background-color: #F3F4F6;
-        }
-        hr {
-            border: none;
-            border-top: 2px solid #E5E7EB;
-            margin: 20px 0;
-        }
-        a {
-            color: #4F46E5;
-            text-decoration: underline;
-        }
-        .highlight {
-            background-color: #FEF3C7;
-            padding: 2px 4px;
-            border-radius: 3px;
-        }
-    </style>';
-    
-    // ✅ If we have raw markdown content, convert it
-    if ($rawContent) {
-        // ✅ CLEAN VERSION: No placeholders needed
-        // Parse markdown to HTML with line breaks enabled
-        $parsedown = new \Parsedown();
-        $parsedown->setBreaksEnabled(true); // ✅ This preserves line breaks
-        $html = $parsedown->text($rawContent);
-        
-        // Apply styles and write
-        $pdf->SetFont('helvetica', '', 11);
-        $pdf->writeHTML($styles . $html, true, false, true, false, '');
-        
-    } else if (!empty($data) && !empty($headers)) {
-        // ✅ Table mode with enhanced styling
-        $pdf->SetFont('helvetica', '', 9);
-        
-        $tableHtml = $styles . '<table>';
-        
-        // Headers
-        $tableHtml .= '<thead><tr>';
-        foreach ($headers as $header) {
-            $tableHtml .= '<th>' . htmlspecialchars($header) . '</th>';
-        }
-        $tableHtml .= '</tr></thead><tbody>';
-        
-        // Data rows
-        foreach ($data as $row) {
-            $tableHtml .= '<tr>';
+        // Data rows (starting from row 6)
+        $row = 6;
+        foreach ($data as $dataRow) {
+            $col = 'A';
             foreach ($headers as $header) {
-                $value = is_array($row) ? ($row[$header] ?? '') : $row;
-                // ✅ Preserve line breaks in table cells too
-                $value = nl2br(htmlspecialchars($value));
-                $tableHtml .= '<td>' . $value . '</td>';
+                $value = is_array($dataRow) ? ($dataRow[$header] ?? '') : $dataRow;
+                $sheet->setCellValue($col . $row, $value);
+                
+                // Apply data cell styling
+                $sheet->getStyle($col . $row)->applyFromArray([
+                    'borders' => [
+                        'allBorders' => [
+                            'borderStyle' => Border::BORDER_THIN,
+                            'color' => ['rgb' => 'E5E7EB'],
+                        ],
+                    ],
+                    'alignment' => [
+                        'vertical' => Alignment::VERTICAL_TOP,
+                        'wrapText' => true,
+                    ],
+                ]);
+                
+                $col++;
             }
-            $tableHtml .= '</tr>';
+            
+            // Alternating row colors
+            if ($row % 2 == 0) {
+                $sheet->getStyle('A' . $row . ':' . chr(64 + count($headers)) . $row)
+                    ->getFill()
+                    ->setFillType(Fill::FILL_SOLID)
+                    ->getStartColor()->setRGB('F9FAFB');
+            }
+            
+            $row++;
         }
         
-        $tableHtml .= '</tbody></table>';
+        // Freeze header row
+        $sheet->freezePane('A6');
         
-        $pdf->writeHTML($tableHtml, true, false, true, false, '');
+        // Add footer
+        $sheet->getHeaderFooter()->setOddFooter('&L&B' . 'ChatterMate AI' . '&RPage &P of &N');
+        
+        $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.xlsx';
+        $writer = new Xlsx($spreadsheet);
+        $writer->save($tempFile);
+        
+        return $tempFile;
     }
-    
-    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.pdf';
-    $pdf->Output($tempFile, 'F');
-    
-    return $tempFile;
-}
 
-/**
- * Generate DOCX file from table data
- */
-private function generateDOCXFile($data, $headers)
-{
-    $phpWord = new PhpWord();
-    
-    // Set document properties
-    $properties = $phpWord->getDocInfo();
-    $properties->setCreator('ChatterMate AI');
-    $properties->setCompany('ChatterMate');
-    $properties->setTitle('ChatterMate Export');
-    $properties->setDescription('Generated by ChatterMate AI');
-    $properties->setCategory('Data Export');
-    $properties->setCreated(time());
-    
-    $section = $phpWord->addSection([
-        'marginLeft' => 1000,
-        'marginRight' => 1000,
-        'marginTop' => 1000,
-        'marginBottom' => 1000,
-    ]);
-    
-    // Add title
-    $section->addText(
-        'ChatterMate AI Export',
-        [
-            'name' => 'Arial',
-            'size' => 18,
-            'bold' => true,
-            'color' => '4F46E5'
-        ],
-        [
-            'alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER,
-            'spaceAfter' => 200
-        ]
-    );
-    
-    // Add metadata
-    $section->addText(
-        'Generated: ' . date('F j, Y \a\t g:i A'),
-        [
-            'name' => 'Arial',
-            'size' => 10,
-            'color' => '6B7280'
-        ],
-        [
-            'alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER,
-            'spaceAfter' => 100
-        ]
-    );
-    
-    $section->addText(
-        'Total Rows: ' . count($data),
-        [
-            'name' => 'Arial',
-            'size' => 10,
-            'italic' => true,
-            'color' => '6B7280'
-        ],
-        [
-            'alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER,
-            'spaceAfter' => 300
-        ]
-    );
-    
-    // Create table
-    $tableStyle = [
-        'borderSize' => 6,
-        'borderColor' => 'E5E7EB',
-        'cellMargin' => 80,
-        'alignment' => \PhpOffice\PhpWord\SimpleType\JcTable::CENTER,
-    ];
-    
-    $headerStyle = [
-        'bold' => true,
-        'color' => 'FFFFFF',
-        'size' => 11,
-        'name' => 'Arial'
-    ];
-    
-    $headerCellStyle = [
-        'bgColor' => '4F46E5',
-        'valign' => 'center'
-    ];
-    
-    $cellStyle = [
-        'valign' => 'top'
-    ];
-    
-    $table = $section->addTable($tableStyle);
-    
-    // Add header row
-    $table->addRow(400);
-    foreach ($headers as $header) {
-        $cell = $table->addCell(2000, $headerCellStyle);
-        $cell->addText(htmlspecialchars($header), $headerStyle, ['alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER]);
-    }
-    
-    // Add data rows
-    foreach ($data as $index => $row) {
-        $table->addRow();
+    /**
+     * Generate TXT file from table data
+     */
+    private function generateTXTFileFromTable($data, $headers)
+    {
+        $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.txt';
+        $content = "ChatterMate Export - Table Data\n\n";
         
-        // Alternating row colors
-        $rowCellStyle = $cellStyle;
-        if ($index % 2 == 0) {
-            $rowCellStyle['bgColor'] = 'F9FAFB';
+        // Add headers
+        $content .= implode(" | ", $headers) . "\n";
+        $content .= str_repeat("-", 50) . "\n";
+        
+        // Add data
+        foreach ($data as $row) {
+            $rowValues = [];
+            foreach ($headers as $header) {
+                $rowValues[] = $row[$header] ?? '';
+            }
+            $content .= implode(" | ", $rowValues) . "\n";
         }
         
-        foreach ($headers as $header) {
-            $value = is_array($row) ? ($row[$header] ?? '') : $row;
-            $cell = $table->addCell(2000, $rowCellStyle);
-            $cell->addText(
-                htmlspecialchars($value),
-                ['name' => 'Arial', 'size' => 10]
-            );
-        }
+        file_put_contents($tempFile, $content);
+        return $tempFile;
     }
-    
-    // Add footer
-    $footer = $section->addFooter();
-    $footer->addPreserveText(
-        'ChatterMate AI | Page {PAGE} of {NUMPAGES}',
-        ['size' => 9, 'color' => '6B7280'],
-        ['alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER]
-    );
-    
-    $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.docx';
-    $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
-    $objWriter->save($tempFile);
-    
-    return $tempFile;
-}
 
-/**
- * Upload file to Azure Blob Storage
- */
-private function uploadFileToAzure($tempFile, $fileName, $format)
-{
-    try {
-        $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
-        $containerName = config('filesystems.disks.azure.container');
-        
-        $azureFileName = 'chattermate-exports/' . $fileName;
-        $fileContent = file_get_contents($tempFile);
-        
-        // Set content type based on format
-        $contentTypes = [
-            'csv' => 'text/csv',
-            'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            'pdf' => 'application/pdf',
-            'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        ];
-        
-        $options = new CreateBlockBlobOptions();
-        $options->setContentType($contentTypes[$format] ?? 'application/octet-stream');
-        
-        $blobClient->createBlockBlob($containerName, $azureFileName, $fileContent, $options);
-        
-        $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
-        return "{$baseUrl}/{$containerName}/{$azureFileName}";
-        
-    } catch (\Exception $e) {
-        Log::error('Azure upload failed: ' . $e->getMessage());
-        throw $e;
-    }
-}
-
-/**
- * Upload table CSV (for inline table exports)
- */
-public function uploadTableCSV(Request $request)
-{
-    try {
-        $file = $request->file('csv_file');
-        
-        if (!$file) {
-            return response()->json(['success' => false, 'error' => 'No file uploaded'], 400);
+    /**
+     * Generate PPTX file from Text
+     * Uses PHPPresentation if available, otherwise fallback or error
+     */
+    private function generatePPTXFileFromText($content, $title)
+    {
+        // Check if class exists (assuming phpoffice/phppresentation might not be installed)
+        if (!class_exists('\PhpOffice\PhpPresentation\PhpPresentation')) {
+            return $this->createBasicPPTX($content, $title);
         }
         
-        $fileName = 'table_' . time() . '.csv';
-        $azureFileName = 'chattermate-exports/' . $fileName;
+        // If library exists:
+        $objPHPPowerPoint = new \PhpOffice\PhpPresentation\PhpPresentation();
+        $currentSlide = $objPHPPowerPoint->getActiveSlide();
+
+        // Create a shape (text)
+        $shape = $currentSlide->createRichTextShape()
+            ->setHeight(600)
+            ->setWidth(900)
+            ->setOffsetX(10)
+            ->setOffsetY(10);
+        $shape->getActiveParagraph()->getAlignment()->setHorizontal( \PhpOffice\PhpPresentation\Style\Alignment::HORIZONTAL_CENTER );
+        $textRun = $shape->createTextRun($title);
+        $textRun->getFont()->setBold(true)->setSize(28)->setColor( new \PhpOffice\PhpPresentation\Style\Color( 'FF000000' ) );
+
+        // Content
+        $shape2 = $currentSlide->createRichTextShape()
+            ->setHeight(600)
+            ->setWidth(900)
+            ->setOffsetX(10)
+            ->setOffsetY(100);
+        $shape2->createTextRun(substr($content, 0, 1000)); // Limit text per slide
+
+        $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.pptx';
+        $oWriterPPTX = \PhpOffice\PhpPresentation\IOFactory::createWriter($objPHPPowerPoint, 'PowerPoint2007');
+        $oWriterPPTX->save($tempFile);
         
-        $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
-        $containerName = config('filesystems.disks.azure.container');
+        return $tempFile;
+    }
+
+    /**
+     * Generate PPTX file from Table
+     */
+    private function generatePPTXFileFromTable($data, $headers, $title)
+    {
+        // Reuse text logic for now but format as table if library exists
+        $content = "Table Data:\n" . implode(" | ", $headers) . "\n...\n(See extracted data)";
+        return $this->generatePPTXFileFromText($content, $title);
+    }
+
+    /**
+     * Minimal PPTX Generator (No Library Fallback)
+     */
+    private function createBasicPPTX($content, $title)
+    {
+        // Minimal error message if library is missing, as manual PPTX creation is too complex for this scope
+        throw new \Exception("PPTX Export requires 'phpoffice/phppresentation'. Please install it via composer.");
+    }
+
+    /**
+     * Generate PDF file from table data
+     */
+    private function generatePDFFile($data, $headers, $rawContent = null)
+    {
+        $pdf = new TCPDF(PDF_PAGE_ORIENTATION, PDF_UNIT, PDF_PAGE_FORMAT, true, 'UTF-8', false);
         
-        $options = new CreateBlockBlobOptions();
-        $options->setContentType('text/csv');
+        // Document information
+        $pdf->SetCreator('ChatterMate AI');
+        $pdf->SetAuthor('ChatterMate AI');
+        $pdf->SetTitle('ChatterMate Export - ' . date('Y-m-d'));
+        $pdf->SetSubject('Data Export');
+        $pdf->SetKeywords('ChatterMate, AI, Export, Data');
         
-        $blobClient->createBlockBlob(
-            $containerName, 
-            $azureFileName, 
-            file_get_contents($file->getRealPath()),
-            $options
+        // Custom header
+        $pdf->SetHeaderData('', 0, 'ChatterMate AI Export', 'Generated: ' . date('F j, Y \a\t g:i A'));
+        
+        // Header and footer fonts
+        $pdf->setHeaderFont([PDF_FONT_NAME_MAIN, '', 11]);
+        $pdf->setFooterFont([PDF_FONT_NAME_DATA, '', 8]);
+        
+        // Margins
+        $pdf->SetMargins(15, 27, 15);
+        $pdf->SetHeaderMargin(5);
+        $pdf->SetFooterMargin(10);
+        
+        // Auto page breaks
+        $pdf->SetAutoPageBreak(TRUE, 25);
+        
+        // Add page
+        $pdf->AddPage();
+        
+        // ✅ Enhanced CSS for better formatting
+        $styles = '
+        <style>
+            body {
+                font-family: helvetica;
+                font-size: 11px;
+                line-height: 1.6;
+                color: #333333;
+            }
+            h1 {
+                color: #4F46E5;
+                font-size: 24px;
+                font-weight: bold;
+                margin-top: 20px;
+                margin-bottom: 15px;
+                padding-bottom: 8px;
+                border-bottom: 3px solid #4F46E5;
+            }
+            h2 {
+                color: #6366F1;
+                font-size: 20px;
+                font-weight: bold;
+                margin-top: 18px;
+                margin-bottom: 12px;
+                padding-bottom: 5px;
+                border-bottom: 2px solid #E0E7FF;
+            }
+            h3 {
+                color: #818CF8;
+                font-size: 16px;
+                font-weight: bold;
+                margin-top: 15px;
+                margin-bottom: 10px;
+            }
+            h4, h5, h6 {
+                color: #A5B4FC;
+                font-size: 14px;
+                font-weight: bold;
+                margin-top: 12px;
+                margin-bottom: 8px;
+            }
+            p {
+                margin-top: 5px;
+                margin-bottom: 10px;
+                text-align: justify;
+                white-space: pre-wrap;
+            }
+            strong, b {
+                font-weight: bold;
+                color: #1F2937;
+            }
+            em, i {
+                font-style: italic;
+                color: #4B5563;
+            }
+            ul, ol {
+                margin-left: 20px;
+                margin-top: 8px;
+                margin-bottom: 12px;
+            }
+            li {
+                margin-bottom: 5px;
+                line-height: 1.5;
+            }
+            code {
+                background-color: #F3F4F6;
+                color: #DC2626;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-family: courier;
+                font-size: 10px;
+            }
+            pre {
+                background-color: #1F2937;
+                color: #F9FAFB;
+                padding: 15px;
+                border-radius: 8px;
+                margin: 15px 0;
+                overflow-x: auto;
+                font-family: courier;
+                font-size: 9px;
+                line-height: 1.4;
+                border-left: 4px solid #4F46E5;
+                white-space: pre-wrap;
+            }
+            pre code {
+                background-color: transparent;
+                color: #F9FAFB;
+                padding: 0;
+            }
+            blockquote {
+                border-left: 4px solid #4F46E5;
+                padding-left: 15px;
+                margin: 15px 0;
+                color: #6B7280;
+                font-style: italic;
+                background-color: #F9FAFB;
+                padding: 10px 15px;
+            }
+            table {
+                border-collapse: collapse;
+                width: 100%;
+                margin: 15px 0;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            }
+            th {
+                background-color: #4F46E5;
+                color: #FFFFFF;
+                font-weight: bold;
+                padding: 12px 10px;
+                text-align: left;
+                border: 1px solid #3730A3;
+                font-size: 11px;
+            }
+            td {
+                padding: 10px;
+                border: 1px solid #E5E7EB;
+                font-size: 10px;
+                vertical-align: top;
+            }
+            tr:nth-child(even) {
+                background-color: #F9FAFB;
+            }
+            tr:nth-child(odd) {
+                background-color: #FFFFFF;
+            }
+            tr:hover {
+                background-color: #F3F4F6;
+            }
+            hr {
+                border: none;
+                border-top: 2px solid #E5E7EB;
+                margin: 20px 0;
+            }
+            a {
+                color: #4F46E5;
+                text-decoration: underline;
+            }
+            .highlight {
+                background-color: #FEF3C7;
+                padding: 2px 4px;
+                border-radius: 3px;
+            }
+        </style>';
+        
+        // ✅ If we have raw markdown content, convert it
+        if ($rawContent) {
+            // ✅ CLEAN VERSION: No placeholders needed
+            // Parse markdown to HTML with line breaks enabled
+            $parsedown = new \Parsedown();
+            $parsedown->setBreaksEnabled(true); // ✅ This preserves line breaks
+            $html = $parsedown->text($rawContent);
+            
+            // Apply styles and write
+            $pdf->SetFont('helvetica', '', 11);
+            $pdf->writeHTML($styles . $html, true, false, true, false, '');
+            
+        } else if (!empty($data) && !empty($headers)) {
+            // ✅ Table mode with enhanced styling
+            $pdf->SetFont('helvetica', '', 9);
+            
+            $tableHtml = $styles . '<table>';
+            
+            // Headers
+            $tableHtml .= '<thead><tr>';
+            foreach ($headers as $header) {
+                $tableHtml .= '<th>' . htmlspecialchars($header) . '</th>';
+            }
+            $tableHtml .= '</tr></thead><tbody>';
+            
+            // Data rows
+            foreach ($data as $row) {
+                $tableHtml .= '<tr>';
+                foreach ($headers as $header) {
+                    $value = is_array($row) ? ($row[$header] ?? '') : $row;
+                    // ✅ Preserve line breaks in table cells too
+                    $value = nl2br(htmlspecialchars($value));
+                    $tableHtml .= '<td>' . $value . '</td>';
+                }
+                $tableHtml .= '</tr>';
+            }
+            
+            $tableHtml .= '</tbody></table>';
+            
+            $pdf->writeHTML($tableHtml, true, false, true, false, '');
+        }
+        
+        $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.pdf';
+        $pdf->Output($tempFile, 'F');
+        
+        return $tempFile;
+    }
+
+    /**
+     * Generate DOCX file from table data
+     */
+    private function generateDOCXFile($data, $headers)
+    {
+        $phpWord = new PhpWord();
+        
+        // Set document properties
+        $properties = $phpWord->getDocInfo();
+        $properties->setCreator('ChatterMate AI');
+        $properties->setCompany('ChatterMate');
+        $properties->setTitle('ChatterMate Export');
+        $properties->setDescription('Generated by ChatterMate AI');
+        $properties->setCategory('Data Export');
+        $properties->setCreated(time());
+        
+        $section = $phpWord->addSection([
+            'marginLeft' => 1000,
+            'marginRight' => 1000,
+            'marginTop' => 1000,
+            'marginBottom' => 1000,
+        ]);
+        
+        // Add title
+        $section->addText(
+            'ChatterMate AI Export',
+            [
+                'name' => 'Arial',
+                'size' => 18,
+                'bold' => true,
+                'color' => '4F46E5'
+            ],
+            [
+                'alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER,
+                'spaceAfter' => 200
+            ]
         );
         
-        $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
-        $downloadUrl = "{$baseUrl}/{$containerName}/{$azureFileName}";
+        // Add metadata
+        $section->addText(
+            'Generated: ' . date('F j, Y \a\t g:i A'),
+            [
+                'name' => 'Arial',
+                'size' => 10,
+                'color' => '6B7280'
+            ],
+            [
+                'alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER,
+                'spaceAfter' => 100
+            ]
+        );
         
-        return response()->json([
-            'success' => true,
-            'download_url' => $downloadUrl,
-            'file_name' => $fileName
-        ]);
+        $section->addText(
+            'Total Rows: ' . count($data),
+            [
+                'name' => 'Arial',
+                'size' => 10,
+                'italic' => true,
+                'color' => '6B7280'
+            ],
+            [
+                'alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER,
+                'spaceAfter' => 300
+            ]
+        );
         
-    } catch (\Exception $e) {
-        Log::error('Table CSV upload failed: ' . $e->getMessage());
-        return response()->json([
-            'success' => false,
-            'error' => 'Upload failed: ' . $e->getMessage()
-        ], 500);
-    }
-}
-
-/**
- * Export table inline (from frontend table data)
- */
-public function exportTableInline(Request $request)
-{
-    try {
-        $request->validate([
-            'format' => 'required|in:csv,xlsx,pdf,docx',
-            'headers' => 'required|array',
-            'data' => 'required|array',
-        ]);
+        // Create table
+        $tableStyle = [
+            'borderSize' => 6,
+            'borderColor' => 'E5E7EB',
+            'cellMargin' => 80,
+            'alignment' => \PhpOffice\PhpWord\SimpleType\JcTable::CENTER,
+        ];
         
-        $format = $request->input('format');
-        $headers = $request->input('headers');
-        $data = $request->input('data');
+        $headerStyle = [
+            'bold' => true,
+            'color' => 'FFFFFF',
+            'size' => 11,
+            'name' => 'Arial'
+        ];
         
-        // Generate file
-        $tempFile = null;
-        $fileName = 'table_export_' . date('Y-m-d_His');
+        $headerCellStyle = [
+            'bgColor' => '4F46E5',
+            'valign' => 'center'
+        ];
         
-        switch ($format) {
-            case 'csv':
-                $tempFile = $this->generateCSVFile($data, $headers);
-                $fileName .= '.csv';
-                break;
-                
-            case 'xlsx':
-                $tempFile = $this->generateExcelFile($data, $headers);
-                $fileName .= '.xlsx';
-                break;
-                
-            case 'pdf':
-                $tempFile = $this->generatePDFFile($data, $headers);
-                $fileName .= '.pdf';
-                break;
-                
-            case 'docx':
-                $tempFile = $this->generateDOCXFile($data, $headers);
-                $fileName .= '.docx';
-                break;
+        $cellStyle = [
+            'valign' => 'top'
+        ];
+        
+        $table = $section->addTable($tableStyle);
+        
+        // Add header row
+        $table->addRow(400);
+        foreach ($headers as $header) {
+            $cell = $table->addCell(2000, $headerCellStyle);
+            $cell->addText(htmlspecialchars($header), $headerStyle, ['alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER]);
         }
         
-        // Upload to Azure
-        $downloadUrl = $this->uploadFileToAzure($tempFile, $fileName, $format);
+        // Add data rows
+        foreach ($data as $index => $row) {
+            $table->addRow();
+            
+            // Alternating row colors
+            $rowCellStyle = $cellStyle;
+            if ($index % 2 == 0) {
+                $rowCellStyle['bgColor'] = 'F9FAFB';
+            }
+            
+            foreach ($headers as $header) {
+                $value = is_array($row) ? ($row[$header] ?? '') : $row;
+                $cell = $table->addCell(2000, $rowCellStyle);
+                $cell->addText(
+                    htmlspecialchars($value),
+                    ['name' => 'Arial', 'size' => 10]
+                );
+            }
+        }
         
-        // Clean up
-        unlink($tempFile);
+        // Add footer
+        $footer = $section->addFooter();
+        $footer->addPreserveText(
+            'ChatterMate AI | Page {PAGE} of {NUMPAGES}',
+            ['size' => 9, 'color' => '6B7280'],
+            ['alignment' => \PhpOffice\PhpWord\SimpleType\Jc::CENTER]
+        );
         
-        return response()->json([
-            'success' => true,
-            'download_url' => $downloadUrl,
-            'file_name' => $fileName
-        ]);
+        $tempFile = tempnam(sys_get_temp_dir(), 'export_') . '.docx';
+        $objWriter = \PhpOffice\PhpWord\IOFactory::createWriter($phpWord, 'Word2007');
+        $objWriter->save($tempFile);
         
-    } catch (\Exception $e) {
-        Log::error('Inline table export error: ' . $e->getMessage());
-        return response()->json([
-            'success' => false,
-            'error' => 'Failed to export: ' . $e->getMessage()
-        ], 500);
+        return $tempFile;
     }
-}
 
-/**
- * Detect WHAT content to export from the request
- */
-private function detectExportContentReference($message)
-{
-    $message = strtolower(trim($message));
-    
-    // Content type keywords
-    $contentTypes = [
-        'code' => ['code', 'script', 'program', 'function', 'algorithm'],
-        'poem' => ['poem', 'poetry', 'verse'],
-        'song' => ['song', 'lyrics', 'music'],
-        'table' => ['table', 'data', 'chart', 'spreadsheet'],
-        'list' => ['list', 'items', 'points'],
-        'story' => ['story', 'narrative', 'tale'],
-        'essay' => ['essay', 'article', 'writing'],
-    ];
-    
-    // Position references
-    $positions = [
-        'this' => 0,      // Current/last message
-        'that' => 0,      // Current/last message
-        'above' => 0,     // Message right before export request
-        'previous' => 0,  // Message right before export request
-        'first' => 'first',
-        'second' => 'second',
-        'last' => 0,
-    ];
-    
-    $result = [
-        'content_type' => null,
-        'position' => 0,  // 0 = last matching message, 'first' = first matching, 'second' = second matching
-    ];
-    
-    // Check for content type references
-    foreach ($contentTypes as $type => $keywords) {
-        foreach ($keywords as $keyword) {
+    /**
+     * Upload file to Azure Blob Storage
+     */
+    private function uploadFileToAzure($tempFile, $fileName, $format)
+    {
+        try {
+            $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
+            $containerName = config('filesystems.disks.azure.container');
+            
+            $azureFileName = 'chattermate-exports/' . $fileName;
+            $fileContent = file_get_contents($tempFile);
+            
+            // Set content type based on format
+            $contentTypes = [
+                'csv' => 'text/csv',
+                'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                'pdf' => 'application/pdf',
+                'docx' => 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            ];
+            
+            $options = new CreateBlockBlobOptions();
+            $options->setContentType($contentTypes[$format] ?? 'application/octet-stream');
+            
+            $blobClient->createBlockBlob($containerName, $azureFileName, $fileContent, $options);
+            
+            $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
+            return "{$baseUrl}/{$containerName}/{$azureFileName}";
+            
+        } catch (\Exception $e) {
+            Log::error('Azure upload failed: ' . $e->getMessage());
+            throw $e;
+        }
+    }
+
+    /**
+     * Upload table CSV (for inline table exports)
+     */
+    public function uploadTableCSV(Request $request)
+    {
+        try {
+            $file = $request->file('csv_file');
+            
+            if (!$file) {
+                return response()->json(['success' => false, 'error' => 'No file uploaded'], 400);
+            }
+            
+            $fileName = 'table_' . time() . '.csv';
+            $azureFileName = 'chattermate-exports/' . $fileName;
+            
+            $blobClient = BlobRestProxy::createBlobService(config('filesystems.disks.azure.connection_string'));
+            $containerName = config('filesystems.disks.azure.container');
+            
+            $options = new CreateBlockBlobOptions();
+            $options->setContentType('text/csv');
+            
+            $blobClient->createBlockBlob(
+                $containerName, 
+                $azureFileName, 
+                file_get_contents($file->getRealPath()),
+                $options
+            );
+            
+            $baseUrl = rtrim(config('filesystems.disks.azure.url'), '/');
+            $downloadUrl = "{$baseUrl}/{$containerName}/{$azureFileName}";
+            
+            return response()->json([
+                'success' => true,
+                'download_url' => $downloadUrl,
+                'file_name' => $fileName
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Table CSV upload failed: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Upload failed: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Export table inline (from frontend table data)
+     */
+    public function exportTableInline(Request $request)
+    {
+        try {
+            $request->validate([
+                'format' => 'required|in:csv,xlsx,pdf,docx',
+                'headers' => 'required|array',
+                'data' => 'required|array',
+            ]);
+            
+            $format = $request->input('format');
+            $headers = $request->input('headers');
+            $data = $request->input('data');
+            
+            // Generate file
+            $tempFile = null;
+            $fileName = 'table_export_' . date('Y-m-d_His');
+            
+            switch ($format) {
+                case 'csv':
+                    $tempFile = $this->generateCSVFile($data, $headers);
+                    $fileName .= '.csv';
+                    break;
+                    
+                case 'xlsx':
+                    $tempFile = $this->generateExcelFile($data, $headers);
+                    $fileName .= '.xlsx';
+                    break;
+                    
+                case 'pdf':
+                    $tempFile = $this->generatePDFFile($data, $headers);
+                    $fileName .= '.pdf';
+                    break;
+                    
+                case 'docx':
+                    $tempFile = $this->generateDOCXFile($data, $headers);
+                    $fileName .= '.docx';
+                    break;
+            }
+            
+            // Upload to Azure
+            $downloadUrl = $this->uploadFileToAzure($tempFile, $fileName, $format);
+            
+            // Clean up
+            unlink($tempFile);
+            
+            return response()->json([
+                'success' => true,
+                'download_url' => $downloadUrl,
+                'file_name' => $fileName
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Inline table export error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Failed to export: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Detect WHAT content to export from the request
+     */
+    private function detectExportContentReference($message)
+    {
+        $message = strtolower(trim($message));
+        
+        // Content type keywords
+        $contentTypes = [
+            'code' => ['code', 'script', 'program', 'function', 'algorithm'],
+            'poem' => ['poem', 'poetry', 'verse'],
+            'song' => ['song', 'lyrics', 'music'],
+            'table' => ['table', 'data', 'chart', 'spreadsheet'],
+            'list' => ['list', 'items', 'points'],
+            'story' => ['story', 'narrative', 'tale'],
+            'essay' => ['essay', 'article', 'writing'],
+        ];
+        
+        // Position references
+        $positions = [
+            'this' => 0,      // Current/last message
+            'that' => 0,      // Current/last message
+            'above' => 0,     // Message right before export request
+            'previous' => 0,  // Message right before export request
+            'first' => 'first',
+            'second' => 'second',
+            'last' => 0,
+        ];
+        
+        $result = [
+            'content_type' => null,
+            'position' => 0,  // 0 = last matching message, 'first' = first matching, 'second' = second matching
+        ];
+        
+        // Check for content type references
+        foreach ($contentTypes as $type => $keywords) {
+            foreach ($keywords as $keyword) {
+                if (str_contains($message, $keyword)) {
+                    $result['content_type'] = $type;
+                    Log::info("Content type detected: {$type}");
+                    break 2;
+                }
+            }
+        }
+        
+        // Check for position references
+        foreach ($positions as $keyword => $position) {
             if (str_contains($message, $keyword)) {
-                $result['content_type'] = $type;
-                Log::info("Content type detected: {$type}");
-                break 2;
+                $result['position'] = $position;
+                Log::info("Position reference detected: {$keyword}");
+                break;
             }
         }
-    }
-    
-    // Check for position references
-    foreach ($positions as $keyword => $position) {
-        if (str_contains($message, $keyword)) {
-            $result['position'] = $position;
-            Log::info("Position reference detected: {$keyword}");
-            break;
-        }
-    }
-    
-    return $result;
-}
-
-/**
- * Identify content type of a message
- */
-private function identifyContentType($content)
-{
-    $types = [];
-    
-    // Check for code blocks
-    if (preg_match('/```[\s\S]*?```/', $content) || 
-        preg_match('/\b(function|class|def|const|var|let|if|else|for|while)\b/', $content)) {
-        $types[] = 'code';
-    }
-    
-    // Check for tables
-    if (preg_match('/\|(.+)\|/', $content)) {
-        $types[] = 'table';
-    }
-    
-    // Check for poem structure (short lines, potential rhyme)
-    $lines = explode("\n", $content);
-    $shortLines = array_filter($lines, fn($line) => strlen(trim($line)) > 0 && strlen(trim($line)) < 60);
-    if (count($shortLines) > 4 && count($shortLines) / max(count($lines), 1) > 0.5) {
-        $types[] = 'poem';
-    }
-    
-    // Check for song/lyrics (verse, chorus, etc.)
-    if (preg_match('/\b(verse|chorus|bridge|refrain|intro|outro)\b/i', $content)) {
-        $types[] = 'song';
-    }
-    
-    // Check for lists
-    if (preg_match('/^[\s]*[-*•]\s+/m', $content) || preg_match('/^\d+\.\s+/m', $content)) {
-        $types[] = 'list';
-    }
-    
-    return $types;
-}
-
-/**
- * Find the right message to export based on user's request
- */
-private function findMessageToExport($conversation, $contentReference, $currentMessageId = null)
-{
-    // Get all assistant messages (excluding the current export request)
-    $messages = $conversation->messages()
-        ->where('role', 'assistant')
-        ->where('id', '!=', $currentMessageId)
-        ->orderBy('created_at', 'desc')
-        ->get();
-    
-    if ($messages->isEmpty()) {
-        return null;
-    }
-    
-    // If no specific content type requested, return the last message
-    if (!$contentReference['content_type']) {
-        Log::info("No content type specified, using last message");
-        return $messages->first();
-    }
-    
-    $targetType = $contentReference['content_type'];
-    $position = $contentReference['position'];
-    
-    Log::info("Searching for content", [
-        'type' => $targetType,
-        'position' => $position,
-        'total_messages' => $messages->count()
-    ]);
-    
-    // Find messages with matching content type
-    $matchingMessages = [];
-    foreach ($messages as $message) {
-        $content = '';
         
-        // Get content from all_responses
-        if ($message->all_responses) {
-            // Remove 'files' key if exists
-            $responses = $message->all_responses;
-            unset($responses['files']);
-            
-            // Get first actual response
-            $actualResponses = array_filter($responses, function($key) {
-                return $key !== 'export' && $key !== 'files';
-            }, ARRAY_FILTER_USE_KEY);
-            
-            if (!empty($actualResponses)) {
-                $content = reset($actualResponses);
-            }
-        } else {
-            $content = $message->content ?? '';
+        return $result;
+    }
+
+    /**
+     * Identify content type of a message
+     */
+    private function identifyContentType($content)
+    {
+        $types = [];
+        
+        // Check for code blocks
+        if (preg_match('/```[\s\S]*?```/', $content) || 
+            preg_match('/\b(function|class|def|const|var|let|if|else|for|while)\b/', $content)) {
+            $types[] = 'code';
         }
         
-        // Identify content types in this message
-        $messageTypes = $this->identifyContentType($content);
+        // Check for tables
+        if (preg_match('/\|(.+)\|/', $content)) {
+            $types[] = 'table';
+        }
         
-        Log::info("Message analysis", [
-            'message_id' => $message->id,
-            'detected_types' => $messageTypes,
-            'content_preview' => substr($content, 0, 100)
+        // Check for poem structure (short lines, potential rhyme)
+        $lines = explode("\n", $content);
+        $shortLines = array_filter($lines, fn($line) => strlen(trim($line)) > 0 && strlen(trim($line)) < 60);
+        if (count($shortLines) > 4 && count($shortLines) / max(count($lines), 1) > 0.5) {
+            $types[] = 'poem';
+        }
+        
+        // Check for song/lyrics (verse, chorus, etc.)
+        if (preg_match('/\b(verse|chorus|bridge|refrain|intro|outro)\b/i', $content)) {
+            $types[] = 'song';
+        }
+        
+        // Check for lists
+        if (preg_match('/^[\s]*[-*•]\s+/m', $content) || preg_match('/^\d+\.\s+/m', $content)) {
+            $types[] = 'list';
+        }
+        
+        return $types;
+    }
+
+    /**
+     * Find the right message to export based on user's request
+     */
+    private function findMessageToExport($conversation, $contentReference, $currentMessageId = null)
+    {
+        // Get all assistant messages (excluding the current export request)
+        $messages = $conversation->messages()
+            ->where('role', 'assistant')
+            ->where('id', '!=', $currentMessageId)
+            ->orderBy('created_at', 'desc')
+            ->get();
+        
+        if ($messages->isEmpty()) {
+            return null;
+        }
+        
+        // If no specific content type requested, return the last message
+        if (!$contentReference['content_type']) {
+            Log::info("No content type specified, using last message");
+            return $messages->first();
+        }
+        
+        $targetType = $contentReference['content_type'];
+        $position = $contentReference['position'];
+        
+        Log::info("Searching for content", [
+            'type' => $targetType,
+            'position' => $position,
+            'total_messages' => $messages->count()
         ]);
         
-        // Check if this message contains the target type
-        if (in_array($targetType, $messageTypes)) {
-            $matchingMessages[] = $message;
+        // Find messages with matching content type
+        $matchingMessages = [];
+        foreach ($messages as $message) {
+            $content = '';
+            
+            // Get content from all_responses
+            if ($message->all_responses) {
+                // Remove 'files' key if exists
+                $responses = $message->all_responses;
+                unset($responses['files']);
+                
+                // Get first actual response
+                $actualResponses = array_filter($responses, function($key) {
+                    return $key !== 'export' && $key !== 'files';
+                }, ARRAY_FILTER_USE_KEY);
+                
+                if (!empty($actualResponses)) {
+                    $content = reset($actualResponses);
+                }
+            } else {
+                $content = $message->content ?? '';
+            }
+            
+            // Identify content types in this message
+            $messageTypes = $this->identifyContentType($content);
+            
+            Log::info("Message analysis", [
+                'message_id' => $message->id,
+                'detected_types' => $messageTypes,
+                'content_preview' => substr($content, 0, 100)
+            ]);
+            
+            // Check if this message contains the target type
+            if (in_array($targetType, $messageTypes)) {
+                $matchingMessages[] = $message;
+            }
+        }
+        
+        if (empty($matchingMessages)) {
+            Log::warning("No messages found with content type: {$targetType}, falling back to last message");
+            return $messages->first();
+        }
+        
+        // Handle position
+        if ($position === 'first') {
+            $selected = end($matchingMessages); // Last in array = first chronologically
+            Log::info("Selected first {$targetType} message", ['id' => $selected->id]);
+            return $selected;
+        } else if ($position === 'second' && count($matchingMessages) >= 2) {
+            $selected = $matchingMessages[count($matchingMessages) - 2];
+            Log::info("Selected second {$targetType} message", ['id' => $selected->id]);
+            return $selected;
+        } else {
+            $selected = $matchingMessages[0]; // First in array = last chronologically
+            Log::info("Selected last {$targetType} message", ['id' => $selected->id]);
+            return $selected;
         }
     }
-    
-    if (empty($matchingMessages)) {
-        Log::warning("No messages found with content type: {$targetType}, falling back to last message");
-        return $messages->first();
-    }
-    
-    // Handle position
-    if ($position === 'first') {
-        $selected = end($matchingMessages); // Last in array = first chronologically
-        Log::info("Selected first {$targetType} message", ['id' => $selected->id]);
-        return $selected;
-    } else if ($position === 'second' && count($matchingMessages) >= 2) {
-        $selected = $matchingMessages[count($matchingMessages) - 2];
-        Log::info("Selected second {$targetType} message", ['id' => $selected->id]);
-        return $selected;
-    } else {
-        $selected = $matchingMessages[0]; // First in array = last chronologically
-        Log::info("Selected last {$targetType} message", ['id' => $selected->id]);
-        return $selected;
-    }
-}
 
 
 }

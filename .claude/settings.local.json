@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(composer update:*)",
+      "Bash(php -m:*)",
+      "Bash(findstr:*)",
+      "Bash(php -i:*)",
+      "Bash(composer require:*)"
+    ]
+  }
+}
